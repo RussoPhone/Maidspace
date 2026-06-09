@@ -17,7 +17,7 @@ Na tela do app:
 2. informe quantos GB quer liberar;
 3. clique em `Escanear MaidSpace`;
 4. veja o potencial em `Ganho espacial A.R.E`;
-5. confirme qualquer acao final apenas quando o A.L.C estiver pronto para executar com seguranca.
+5. abra `A.L.C`, escolha uma pasta de destino ou `lixeira`, revise os arquivos e confirme a realocacao.
 
 ## Pelo Terminal
 
@@ -42,7 +42,7 @@ Saidas geradas:
 
 - **A.D.D** inventaria arquivos, dependencias, risco e grafo.
 - **A.R.E** calcula quanto espaco pode ser liberado por nivel.
-- **A.L.C** sera a camada de confirmacao/execucao continua para nao interferir no usuario.
+- **A.L.C** move arquivos confirmados pelo usuario para outro diretorio ou para a lixeira. A execucao continua vem depois.
 
 ## Testes
 

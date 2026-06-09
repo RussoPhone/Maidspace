@@ -18,7 +18,16 @@ const state = {
   graphRenderFrame: 0,
   scanProgressTimer: null,
   scanProgressStartedAt: 0,
-  scanProgressPercent: 0
+  scanProgressPercent: 0,
+  lastAlcReport: null,
+  alcFilters: {
+    areMode: "target",
+    risks: ["baixo", "medio", "alto", "critico"]
+  },
+  alcDraft: {
+    targetKind: "directory",
+    targetDirectory: ""
+  }
 };
 
 const labels = {
@@ -84,6 +93,7 @@ const graphModes = {
 const elements = {
   serverStatus: document.querySelector("#serverStatus"),
   rootPath: document.querySelector("#rootPath"),
+  chooseRootButton: document.querySelector("#chooseRootButton"),
   targetFreeGb: document.querySelector("#targetFreeGb"),
   scanButton: document.querySelector("#scanButton"),
   scanProgress: document.querySelector("#scanProgress"),
@@ -110,12 +120,17 @@ const elements = {
   closeAreModal: document.querySelector("#closeAreModal"),
   areModal: document.querySelector("#areModal"),
   areModalBody: document.querySelector("#areModalBody"),
+  openAlcModal: document.querySelector("#openAlcModal"),
+  closeAlcModal: document.querySelector("#closeAlcModal"),
+  alcModal: document.querySelector("#alcModal"),
+  alcModalBody: document.querySelector("#alcModalBody"),
   continuousState: document.querySelector("#continuousState"),
   depthTimeline: document.querySelector("#depthTimeline"),
   dependenciesTable: document.querySelector("#dependenciesTable"),
   cyclesList: document.querySelector("#cyclesList"),
   textReport: document.querySelector("#textReport"),
-  warningsList: document.querySelector("#warningsList")
+  warningsList: document.querySelector("#warningsList"),
+  fileDependencyPopover: document.querySelector("#fileDependencyPopover")
 };
 
 init();
@@ -138,6 +153,7 @@ async function init() {
 
 function bindEvents() {
   elements.scanButton.addEventListener("click", runScan);
+  elements.chooseRootButton?.addEventListener("click", chooseRootDirectory);
   elements.exportButton.addEventListener("click", exportJson);
   elements.graphFilter.addEventListener("change", renderGraph);
   elements.depthFilter?.addEventListener("change", () => {
@@ -152,6 +168,7 @@ function bindEvents() {
   elements.graphCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
   elements.graphCanvas.addEventListener("mousedown", startGraphPan);
   elements.graphCanvas.addEventListener("mousemove", hoverCanvasNode);
+  elements.graphCanvas.addEventListener("wheel", zoomGraphWithWheel, { passive: false });
   window.addEventListener("mouseup", stopGraphPan);
   elements.graphCanvas.addEventListener("mouseleave", () => {
     if (state.isPanningGraph) {
@@ -169,8 +186,18 @@ function bindEvents() {
   elements.openAreModal?.addEventListener("click", openAreModal);
   elements.closeAreModal?.addEventListener("click", closeAreModal);
   elements.areModal?.querySelector("[data-close-modal='are']")?.addEventListener("click", closeAreModal);
+  elements.openAlcModal?.addEventListener("click", openAlcModal);
+  elements.closeAlcModal?.addEventListener("click", closeAlcModal);
+  elements.alcModal?.querySelector("[data-close-modal='alc']")?.addEventListener("click", closeAlcModal);
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    if (elements.alcModal && !elements.alcModal.classList.contains("is-hidden")) {
+      closeAlcModal();
+      return;
+    }
+    if (elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
       closeAreModal();
     }
   });
@@ -196,13 +223,13 @@ function bindEvents() {
 }
 
 function setGraphMode(modeKey) {
-  const zoomByMode = {
-    far: 0.62,
-    medium: 1,
-    close: 1.85
-  };
-  state.zoom = zoomByMode[modeKey] || 1;
+  if (!graphModes[modeKey]) {
+    return;
+  }
+  state.graphMode = modeKey;
+  state.zoom = 1;
   state.graphPan = { x: 0, y: 0 };
+  state.expandedGroups.clear();
   scheduleGraphRender();
 }
 
@@ -268,6 +295,26 @@ function syncOptionsFromResult() {
   }
 }
 
+async function chooseRootDirectory() {
+  try {
+    const directory = await pickDirectory("Cole o caminho da pasta raiz para varrer:");
+    if (directory) {
+      elements.rootPath.value = directory;
+      appendSystemLog(`Diretorio raiz definido: ${directory}`);
+    }
+  } catch (error) {
+    appendSystemLog(`Falha ao escolher diretorio: ${errorMessage(error)}`);
+  }
+}
+
+async function pickDirectory(fallbackMessage = "Cole o caminho da pasta:") {
+  if (isNativeMaidSpace()) {
+    return await fetchNative("/api/pick-directory", { method: "POST" });
+  }
+
+  return window.prompt(fallbackMessage, "") || null;
+}
+
 async function fetchJson(url, options) {
   if (isNativeMaidSpace()) {
     return fetchNative(url, options);
@@ -291,6 +338,9 @@ async function fetchNative(url, options = {}) {
     if (url === "/api/health") {
       return await invoke("maidspace_health");
     }
+    if (url === "/api/pick-directory") {
+      return await invoke("pick_directory");
+    }
     if (url === "/api/scan") {
       const body = JSON.parse(options.body || "{}");
       const targetFreeBytes = body.options?.targetFreeBytes || 0;
@@ -299,6 +349,12 @@ async function fetchNative(url, options = {}) {
         targetFreeBytes
       });
       return nativeReportToResult(scan, body.rootPath, body.options || {});
+    }
+    if (url === "/api/alc/relocate") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("execute_alc_relocation", {
+        request: body.request
+      });
     }
   } catch (error) {
     throw asError(error);
@@ -1061,6 +1117,8 @@ function renderEmpty() {
   if (elements.areSummary) elements.areSummary.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
   if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
   if (elements.openAreModal) elements.openAreModal.disabled = true;
+  if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty("Execute uma varredura para preparar o A.L.C.");
+  if (elements.openAlcModal) elements.openAlcModal.disabled = true;
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado.");
   if (elements.textReport) elements.textReport.textContent = "";
@@ -1078,6 +1136,8 @@ function renderError(message) {
   if (elements.areSummary) elements.areSummary.innerHTML = empty(message);
   if (elements.areModalBody) elements.areModalBody.innerHTML = empty(message);
   if (elements.openAreModal) elements.openAreModal.disabled = true;
+  if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty(message);
+  if (elements.openAlcModal) elements.openAlcModal.disabled = true;
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty(message);
   if (elements.textReport) elements.textReport.textContent = message;
@@ -1142,6 +1202,13 @@ function metricMarkup(items) {
   `).join("");
 }
 
+function fileMapButton(path, label = path) {
+  if (!path) {
+    return "-";
+  }
+  return `<button class="file-map-link" type="button" data-file-map="${escapeHtml(path)}">${escapeHtml(label || path)}</button>`;
+}
+
 function renderGraph() {
   if (!state.result) {
     clearCanvas("Execute uma varredura para renderizar o grafo.");
@@ -1194,13 +1261,7 @@ function renderGraph() {
 }
 
 function resolveGraphMode() {
-  if (state.zoom < 0.82) {
-    return graphModes.far;
-  }
-  if (state.zoom < 1.65) {
-    return graphModes.medium;
-  }
-  return graphModes.close;
+  return graphModes[state.graphMode] || graphModes.medium;
 }
 
 function updateZoomLabel(mode = resolveGraphMode()) {
@@ -1216,6 +1277,36 @@ function updateZoomLabel(mode = resolveGraphMode()) {
 
 function graphScale() {
   return clamp(state.zoom, 0.42, 3.6);
+}
+
+function zoomGraphWithWheel(event) {
+  if (!state.result) {
+    return;
+  }
+  event.preventDefault();
+
+  const rect = elements.graphCanvas.getBoundingClientRect();
+  const screenX = event.clientX - rect.left;
+  const screenY = event.clientY - rect.top;
+  const previousTransform = state.graphTransform;
+  const worldPoint = previousTransform
+    ? screenToWorld(screenX, screenY, previousTransform)
+    : { x: rect.width / 2, y: rect.height / 2 };
+
+  const factor = event.deltaY < 0 ? 1.12 : 0.89;
+  state.zoom = clamp(state.zoom * factor, 0.42, 3.6);
+
+  if (previousTransform) {
+    const scale = graphScale();
+    const baseX = (rect.width - previousTransform.worldWidth * scale) / 2;
+    const baseY = (rect.height - previousTransform.worldHeight * scale) / 2;
+    state.graphPan = {
+      x: screenX - worldPoint.x * scale - baseX,
+      y: screenY - worldPoint.y * scale - baseY
+    };
+  }
+
+  scheduleGraphRender();
 }
 
 function graphWorldSize(width, height, nodeCount, mode) {
@@ -1923,6 +2014,16 @@ function stopGraphPan() {
 }
 
 function clearNodeSelectionOnOutsideClick(event) {
+  const fileMapTrigger = event.target.closest?.("[data-file-map]");
+  const clickedDependencyPopover = event.target.closest?.("#fileDependencyPopover");
+  if (fileMapTrigger) {
+    showFileDependencyPopover(fileMapTrigger.dataset.fileMap, event);
+    return;
+  }
+  if (!clickedDependencyPopover) {
+    hideFileDependencyPopover();
+  }
+
   if (!state.selectedNodeId) {
     return;
   }
@@ -1935,6 +2036,128 @@ function clearNodeSelectionOnOutsideClick(event) {
   state.selectedNodeId = null;
   renderNodeDetails();
   renderGraph();
+}
+
+function showFileDependencyPopover(path, event) {
+  const popover = elements.fileDependencyPopover;
+  if (!popover || !path) {
+    return;
+  }
+
+  const node = findFileNodeByPath(path);
+  const dependencyMap = buildFileDependencyMap(path, node);
+  popover.innerHTML = renderFileDependencyPopover(path, node, dependencyMap);
+  popover.classList.remove("is-hidden");
+
+  const width = Math.min(440, window.innerWidth - 24);
+  const estimatedHeight = Math.min(520, window.innerHeight - 24);
+  let left = event.clientX + 14;
+  let top = event.clientY + 14;
+  if (left + width > window.innerWidth - 12) {
+    left = Math.max(12, event.clientX - width - 14);
+  }
+  if (top + estimatedHeight > window.innerHeight - 12) {
+    top = Math.max(12, window.innerHeight - estimatedHeight - 12);
+  }
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+}
+
+function hideFileDependencyPopover() {
+  elements.fileDependencyPopover?.classList.add("is-hidden");
+}
+
+function renderFileDependencyPopover(path, node, dependencyMap) {
+  const incoming = dependencyMap.incoming.slice(0, 8);
+  const outgoing = dependencyMap.outgoing.slice(0, 8);
+  const related = [...incoming, ...outgoing].slice(0, 10);
+  return `
+    <header class="file-map-header">
+      <div>
+        <span>Mapa de dependencias</span>
+        <strong>${escapeHtml(node?.name || path.split(/[\\/]/).pop() || path)}</strong>
+      </div>
+      <small>${node ? formatBytes(node.size || 0) : "arquivo citado"}</small>
+    </header>
+    <dl class="file-map-facts">
+      <dt>caminho</dt><dd>${fileMapButton(path)}</dd>
+      <dt>risco</dt><dd>${node ? riskMarkup(node.risk) : "-"}</dd>
+      <dt>decisao</dt><dd>${node ? escapeHtml(decisionLabel(node.deletionDecision)) : "-"}</dd>
+      <dt>utilidade</dt><dd>${node ? escapeHtml(utilityLabel(node.utilityStatus)) : "-"}</dd>
+    </dl>
+    <div class="dependency-mini-map" aria-label="Mapa compacto de dependencias">
+      <div class="dependency-side">
+        <span>Entrada</span>
+        <b>${formatNumber(dependencyMap.incoming.length)}</b>
+      </div>
+      <div class="dependency-center">
+        <span>${escapeHtml(trimLabel(node?.name || path, 34))}</span>
+      </div>
+      <div class="dependency-side">
+        <span>Saida</span>
+        <b>${formatNumber(dependencyMap.outgoing.length)}</b>
+      </div>
+    </div>
+    <div class="file-map-columns">
+      <section>
+        <h3>Depende dele</h3>
+        ${incoming.length ? `<ol>${incoming.map((item) => `<li>${fileMapButton(item.path)}<small>${escapeHtml(item.type || "dep")}</small></li>`).join("")}</ol>` : `<p class="muted">Nenhuma entrada registrada.</p>`}
+      </section>
+      <section>
+        <h3>Ele depende de</h3>
+        ${outgoing.length ? `<ol>${outgoing.map((item) => `<li>${fileMapButton(item.path)}<small>${escapeHtml(item.type || "dep")}</small></li>`).join("")}</ol>` : `<p class="muted">Nenhuma saida registrada.</p>`}
+      </section>
+    </div>
+    ${related.length ? "" : `<p class="muted">Sem arestas no inventario atual; para arquivos do modo Rust local, o A.D.D pode ter apenas metadados.</p>`}
+  `;
+}
+
+function buildFileDependencyMap(path, node) {
+  const normalizedPath = normalizePathKey(path);
+  const nodeId = node?.id;
+  const incoming = [];
+  const outgoing = [];
+  for (const edge of state.result?.edges || []) {
+    const sourcePath = edge.sourcePath || nodePathFromId(edge.source);
+    const targetPath = edge.targetPath || nodePathFromId(edge.target);
+    const sourceMatches = edge.source === nodeId || normalizePathKey(sourcePath) === normalizedPath;
+    const targetMatches = edge.target === nodeId || normalizePathKey(targetPath) === normalizedPath;
+    if (targetMatches && sourcePath) {
+      incoming.push({ path: sourcePath, type: edge.type });
+    }
+    if (sourceMatches && targetPath) {
+      outgoing.push({ path: targetPath, type: edge.type });
+    }
+  }
+  return {
+    incoming: uniqueFileMapItems(incoming),
+    outgoing: uniqueFileMapItems(outgoing)
+  };
+}
+
+function uniqueFileMapItems(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = `${normalizePathKey(item.path)}:${item.type || ""}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function findFileNodeByPath(path) {
+  const normalized = normalizePathKey(path);
+  return (state.result?.nodes || []).find((node) => normalizePathKey(node.relativePath) === normalized);
+}
+
+function nodePathFromId(id) {
+  return (state.result?.nodes || []).find((node) => node.id === id)?.relativePath || "";
+}
+
+function normalizePathKey(path) {
+  return String(path || "").replace(/\\/g, "/").toLowerCase();
 }
 
 function renderNodeDetails() {
@@ -1963,7 +2186,7 @@ function renderNodeDetails() {
     <h2>${escapeHtml(node.label || node.name || node.relativePath)}</h2>
     <dl>
       <dt>visão</dt><dd>${escapeHtml(graphModes[state.graphMode]?.label || "arquivo")}</dd>
-      <dt>caminho</dt><dd>${escapeHtml(node.relativePath || "-")}</dd>
+      <dt>caminho</dt><dd>${fileMapButton(node.relativePath || "-")}</dd>
       <dt>classe</dt><dd>${escapeHtml(labels[node.classification] || node.classification || "-")}</dd>
       <dt>risco</dt><dd>${riskMarkup(node.risk)}</dd>
       <dt>apagar</dt><dd>${escapeHtml(decisionLabel(node.deletionDecision))}</dd>
@@ -2040,7 +2263,7 @@ function renderFiles() {
             <td>${formatNumber(node.depth || 0)}</td>
             <td>${formatAccess(node.daysSinceAccess)}</td>
             <td>${formatBytes(node.size || 0)}</td>
-            <td class="path-cell">${escapeHtml(node.relativePath)}</td>
+            <td class="path-cell">${fileMapButton(node.relativePath)}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -2080,7 +2303,7 @@ function renderSimulation() {
           <ol>
             ${items.slice(0, 24).map((item) => `
               <li>
-                ${escapeHtml(item.path)}
+                ${fileMapButton(item.path)}
                 <span class="muted">${escapeHtml(item.reason)}</span>
               </li>
             `).join("")}
@@ -2124,14 +2347,24 @@ function renderRelocationPlan() {
     elements.areSummary.innerHTML = empty("Plano A.R.E indisponivel.");
     elements.areModalBody.innerHTML = empty("Plano A.R.E indisponivel.");
     if (elements.openAreModal) elements.openAreModal.disabled = true;
+    if (elements.openAlcModal) elements.openAlcModal.disabled = true;
+    if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty("Plano A.L.C indisponivel.");
     return;
   }
 
   if (elements.openAreModal) elements.openAreModal.disabled = false;
+  if (elements.openAlcModal) elements.openAlcModal.disabled = !getAlcCandidates({ applyRiskFilters: false }).length;
   elements.areSummary.innerHTML = renderAreSummary(plan);
   elements.areModalBody.innerHTML = renderAreModal(plan);
+  if (elements.alcModalBody) elements.alcModalBody.innerHTML = renderAlcModal();
   elements.areSummary.querySelectorAll("[data-open-are-modal]").forEach((button) => {
     button.addEventListener("click", openAreModal);
+  });
+  elements.areModalBody.querySelectorAll("[data-open-alc-modal]").forEach((button) => {
+    button.addEventListener("click", () => {
+      closeAreModal();
+      openAlcModal();
+    });
   });
 }
 
@@ -2162,6 +2395,7 @@ function renderAreModal(plan) {
   const modes = ["baixo", "medio", "alto"];
   return `
     ${renderTargetPlan(plan.targetPlan || plan.summary?.targetPlan)}
+    ${renderAreAlcBridge(plan)}
     ${renderAreSimulation(plan)}
     ${renderAreDepthBreakdown(plan)}
     <section class="are-modal-summary">
@@ -2188,6 +2422,43 @@ function renderAreModal(plan) {
     </section>
     ${modes.map((modeKey) => renderAreMode(plan.spaceModes?.[modeKey], modeKey)).join("")}
     ${renderBlockedFiles(plan.blockedFiles || [])}
+  `;
+}
+
+function renderAreAlcBridge(plan) {
+  const candidates = getAlcCandidates({ applyRiskFilters: false });
+  if (!candidates.length) {
+    return "";
+  }
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
+  const total = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  return `
+    <section class="are-simulation-board are-alc-bridge">
+      <div class="are-section-heading">
+        <div>
+          <h3>A.R.E -> A.L.C</h3>
+          <p class="muted">Use o plano do A.R.E como fila editavel do A.L.C: filtre por nivel, risco e confirme apenas o que deve ser realocado.</p>
+        </div>
+        <button class="primary-button" type="button" data-open-alc-modal>Abrir A.L.C</button>
+      </div>
+      <div class="are-simulation-grid">
+        <article class="are-sim-card">
+          <span>Fila inicial</span>
+          <strong>${formatNumber(candidates.length)}</strong>
+          <small>arquivo(s) detalhados</small>
+        </article>
+        <article class="are-sim-card">
+          <span>Espaco visivel</span>
+          <strong>${formatBytes(total)}</strong>
+          <small>A.L.C confirma antes de mover</small>
+        </article>
+        <article class="are-sim-card">
+          <span>Nivel sugerido</span>
+          <strong>${escapeHtml(modeLabel(targetPlan?.selectedMode || "alto"))}</strong>
+          <small>${escapeHtml(targetPlan?.status || "manual")}</small>
+        </article>
+      </div>
+    </section>
   `;
 }
 
@@ -2347,7 +2618,7 @@ function renderArePackageTable(packages) {
         <tbody>
           ${packages.slice(0, 60).map((item) => `
             <tr>
-              <td class="path-cell">${escapeHtml(item.files[0] || item.id)}</td>
+              <td class="path-cell">${fileMapButton(item.files[0] || item.id)}</td>
               <td>${escapeHtml(item.human || formatBytes(item.bytes || 0))}</td>
               <td>${formatNumber(item.fileCount || 0)}</td>
               <td>${escapeHtml(item.targetDirectory || "-")}</td>
@@ -2381,7 +2652,7 @@ function renderAreCandidateTable(candidates) {
         <tbody>
           ${candidates.slice(0, 80).map((item) => `
             <tr>
-              <td class="path-cell">${escapeHtml(item.path)}</td>
+              <td class="path-cell">${fileMapButton(item.path)}</td>
               <td>${escapeHtml(item.packageHuman || item.sizeHuman || "0 B")}<br><span class="muted">${formatNumber(item.packageFileCount || 1)} arquivo(s)</span></td>
               <td>${escapeHtml(labels[item.classification] || item.classification || "-")}</td>
               <td>${riskMarkup(item.risk)}</td>
@@ -2420,7 +2691,7 @@ function renderBlockedFiles(blockedFiles) {
             <tbody>
               ${blockedFiles.slice(0, 120).map((item) => `
                 <tr>
-                  <td class="path-cell">${escapeHtml(item.path)}</td>
+                  <td class="path-cell">${fileMapButton(item.path)}</td>
                   <td>${escapeHtml(item.sizeHuman || formatBytes(item.sizeBytes || 0))}</td>
                   <td>${escapeHtml(labels[item.classification] || item.classification || "-")}</td>
                   <td>${riskMarkup(item.risk)}</td>
@@ -2441,7 +2712,7 @@ function openAreModal() {
   }
   elements.areModal.classList.remove("is-hidden");
   elements.areModal.setAttribute("aria-hidden", "false");
-  document.body.classList.add("modal-open");
+  setModalOpenState();
 }
 
 function closeAreModal() {
@@ -2450,7 +2721,414 @@ function closeAreModal() {
   }
   elements.areModal.classList.add("is-hidden");
   elements.areModal.setAttribute("aria-hidden", "true");
-  document.body.classList.remove("modal-open");
+  setModalOpenState();
+}
+
+function openAlcModal() {
+  if (!state.result?.relocationPlan || !elements.alcModal || !elements.alcModalBody) {
+    return;
+  }
+  elements.alcModalBody.innerHTML = renderAlcModal();
+  elements.alcModal.classList.remove("is-hidden");
+  elements.alcModal.setAttribute("aria-hidden", "false");
+  setModalOpenState();
+  wireAlcModalControls();
+}
+
+function closeAlcModal() {
+  if (!elements.alcModal) {
+    return;
+  }
+  elements.alcModal.classList.add("is-hidden");
+  elements.alcModal.setAttribute("aria-hidden", "true");
+  setModalOpenState();
+}
+
+function setModalOpenState() {
+  const anyOpen = [elements.areModal, elements.alcModal].some((modal) => modal && !modal.classList.contains("is-hidden"));
+  document.body.classList.toggle("modal-open", anyOpen);
+}
+
+function renderAlcModal() {
+  const candidates = getAlcCandidates();
+  const allCandidates = getAlcCandidates({ applyRiskFilters: false });
+  const targetPlan = state.result?.relocationPlan?.targetPlan || state.result?.relocationPlan?.summary?.targetPlan;
+  if (!state.result?.relocationPlan) {
+    return empty("Execute uma varredura para preparar o A.L.C.");
+  }
+  if (!allCandidates.length) {
+    return empty("Nenhum candidato detalhado para o A.L.C executar agora.");
+  }
+
+  const totalBytes = allCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const visibleBytes = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const userContentCount = candidates.filter(isLikelyUserContentCandidate).length;
+  const nativeExecutor = isNativeMaidSpace();
+  const activeMode = currentAlcAreMode();
+  const activeRisks = currentAlcRisks();
+  const estimateWarning = targetPlan?.status === "estimativa_exige_mais_detalhe"
+    ? `<div class="alc-alert">O A.R.E atingiu a meta por estimativa compactada. O A.L.C MVP executa apenas os candidatos detalhados abaixo; uma etapa futura pode pedir uma segunda varredura focada para completar a meta.</div>`
+    : "";
+  const nativeWarning = nativeExecutor
+    ? ""
+    : `<div class="alc-alert is-strong">O executor A.L.C precisa do MaidSpace local/Tauri. No fallback web, esta tela serve apenas para revisar a fila.</div>`;
+  const userWarning = userContentCount
+    ? `<div class="alc-alert is-strong">${formatNumber(userContentCount)} candidato(s) parecem conteudo criado pelo usuario. Revise a selecao antes de executar.</div>`
+    : "";
+
+  return `
+    <section class="alc-console">
+      ${nativeWarning}
+      ${estimateWarning}
+      ${userWarning}
+      <div class="alc-summary">
+        <span><strong>${formatNumber(candidates.length)}</strong> visivel(is)</span>
+        <span><strong>${formatNumber(allCandidates.length)}</strong> na fonte</span>
+        <span><strong>${formatBytes(visibleBytes)}</strong> filtrados</span>
+        <span><strong>${formatBytes(totalBytes)}</strong> fonte completa</span>
+        <span><strong>${escapeHtml(targetPlan?.targetHuman || "0 B")}</strong> meta</span>
+        <span><strong>${escapeHtml(modeLabel(targetPlan?.selectedMode || "alto"))}</strong> nivel sugerido</span>
+      </div>
+      <div class="alc-filter-grid">
+        <label class="field">
+          <span>Fonte A.R.E</span>
+          <select id="alcAreMode">
+            <option value="target"${activeMode === "target" ? " selected" : ""}>Plano da meta</option>
+            <option value="baixo"${activeMode === "baixo" ? " selected" : ""}>Nivel baixo</option>
+            <option value="medio"${activeMode === "medio" ? " selected" : ""}>Nivel medio</option>
+            <option value="alto"${activeMode === "alto" ? " selected" : ""}>Nivel alto</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>Riscos na fila</span>
+          <div class="alc-risk-filter">
+            ${["baixo", "medio", "alto", "critico"].map((risk) => `
+              <label>
+                <input type="checkbox" data-alc-risk-filter="${escapeHtml(risk)}"${activeRisks.includes(risk) ? " checked" : ""}>
+                <span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span>
+              </label>
+            `).join("")}
+          </div>
+        </div>
+      </div>
+      <div class="alc-control-grid" role="radiogroup" aria-label="Destino do A.L.C">
+        <label class="alc-target-card">
+          <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "trash" ? "" : " checked"}>
+          <span><b>Mover para pasta</b><br>Preserva a estrutura relativa dentro do destino escolhido.</span>
+        </label>
+        <label class="alc-target-card">
+          <input type="radio" name="alcTargetKind" value="trash"${state.alcDraft.targetKind === "trash" ? " checked" : ""}>
+          <span><b>Enviar para lixeira</b><br>Usa a lixeira do sistema, sem exclusao permanente imediata.</span>
+        </label>
+      </div>
+      <div id="alcDestinationBlock" class="alc-destination">
+        <label class="field">
+          <span>Destino A.L.C</span>
+          <div class="input-action-row">
+            <input id="alcDestinationPath" type="text" spellcheck="false" placeholder="D:\\MaidSpace\\Realocados" value="${escapeHtml(state.alcDraft.targetDirectory || "")}">
+            <button id="chooseAlcDestination" class="ghost-button" type="button">Escolher</button>
+          </div>
+        </label>
+        <p class="muted">Escolha uma pasta fora da raiz varrida para realmente tirar dados do diretorio analisado.</p>
+      </div>
+      <div class="alc-action-row">
+        <div>
+          <button id="alcSelectAll" class="ghost-button" type="button">Selecionar tudo</button>
+          <button id="alcClearSelection" class="ghost-button" type="button">Limpar selecao</button>
+        </div>
+        <span id="alcSelectedSummary" class="muted">Calculando selecao...</span>
+      </div>
+      <div class="table-wrap alc-table-wrap">
+        <table class="alc-table">
+          <thead>
+            <tr>
+              <th>Usar</th>
+              <th>Arquivo</th>
+              <th>Espaco</th>
+              <th>Risco</th>
+              <th>Decisao</th>
+              <th>Motivo</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${candidates.length ? candidates.slice(0, 220).map((item) => {
+              const userContent = isLikelyUserContentCandidate(item);
+              return `
+                <tr>
+                  <td><input type="checkbox" data-alc-file="${escapeHtml(item.path)}" checked aria-label="Selecionar ${escapeHtml(item.path)}"></td>
+                  <td class="path-cell">
+                    ${fileMapButton(item.path)}
+                    ${userContent ? `<span class="alc-user-warning">possivel arquivo do usuario</span>` : ""}
+                  </td>
+                  <td>${escapeHtml(item.sizeHuman || item.packageHuman || formatBytes(candidateBytes(item)))}</td>
+                  <td>${riskMarkup(item.risk)}</td>
+                  <td>${escapeHtml(decisionLabel(item.deletionDecision))}</td>
+                  <td>${escapeHtml(item.justification || item.reason || "candidato A.R.E")}</td>
+                </tr>
+              `;
+            }).join("") : `
+              <tr>
+                <td colspan="6">${empty("Nenhum arquivo combina com os filtros atuais.")}</td>
+              </tr>
+            `}
+          </tbody>
+        </table>
+      </div>
+      <div id="alcResult" class="alc-result is-hidden"></div>
+      <div class="alc-footer">
+        <p class="muted">O A.L.C MVP move arquivos confirmados. A execucao continua sera ligada em etapa posterior.</p>
+        <button id="executeAlcButton" class="primary-button" type="button"${nativeExecutor ? "" : " disabled"}>Executar A.L.C</button>
+      </div>
+    </section>
+  `;
+}
+
+function wireAlcModalControls() {
+  const body = elements.alcModalBody;
+  if (!body) {
+    return;
+  }
+
+  const destinationInput = body.querySelector("#alcDestinationPath");
+  const executeButton = body.querySelector("#executeAlcButton");
+  const destinationBlock = body.querySelector("#alcDestinationBlock");
+  const summary = body.querySelector("#alcSelectedSummary");
+  const update = () => {
+    const kind = body.querySelector("input[name='alcTargetKind']:checked")?.value || "directory";
+    state.alcDraft.targetKind = kind;
+    state.alcDraft.targetDirectory = destinationInput?.value.trim() || "";
+    const selected = selectedAlcCandidates();
+    const bytes = selected.reduce((sum, item) => sum + candidateBytes(item), 0);
+    const hasDestination = kind === "trash" || Boolean(destinationInput?.value.trim());
+    if (destinationBlock) {
+      destinationBlock.style.display = kind === "directory" ? "grid" : "none";
+    }
+    if (summary) {
+      summary.textContent = `${formatNumber(selected.length)} arquivo(s), ${formatBytes(bytes)} selecionados`;
+    }
+    if (executeButton) {
+      executeButton.disabled = !isNativeMaidSpace() || !selected.length || !hasDestination;
+    }
+  };
+
+  body.querySelector("#alcAreMode")?.addEventListener("change", (event) => {
+    state.alcFilters.areMode = event.target.value;
+    refreshAlcModal();
+  });
+  body.querySelectorAll("[data-alc-risk-filter]").forEach((input) => {
+    input.addEventListener("change", () => {
+      state.alcFilters.risks = Array.from(body.querySelectorAll("[data-alc-risk-filter]:checked"))
+        .map((item) => item.dataset.alcRiskFilter);
+      refreshAlcModal();
+    });
+  });
+  body.querySelectorAll("input[name='alcTargetKind']").forEach((input) => {
+    input.addEventListener("change", update);
+  });
+  body.querySelectorAll("[data-alc-file]").forEach((input) => {
+    input.addEventListener("change", update);
+  });
+  destinationInput?.addEventListener("input", update);
+  body.querySelector("#chooseAlcDestination")?.addEventListener("click", async () => {
+    try {
+      const directory = await pickDirectory("Cole o caminho de destino do A.L.C:");
+      if (directory && destinationInput) {
+        destinationInput.value = directory;
+        update();
+      }
+    } catch (error) {
+      showAlcResult(null, error);
+    }
+  });
+  body.querySelector("#alcSelectAll")?.addEventListener("click", () => {
+    body.querySelectorAll("[data-alc-file]").forEach((input) => {
+      input.checked = true;
+    });
+    update();
+  });
+  body.querySelector("#alcClearSelection")?.addEventListener("click", () => {
+    body.querySelectorAll("[data-alc-file]").forEach((input) => {
+      input.checked = false;
+    });
+    update();
+  });
+  executeButton?.addEventListener("click", executeAlcRelocation);
+  update();
+}
+
+function refreshAlcModal() {
+  if (!elements.alcModalBody || elements.alcModal?.classList.contains("is-hidden")) {
+    return;
+  }
+  elements.alcModalBody.innerHTML = renderAlcModal();
+  wireAlcModalControls();
+}
+
+function currentAlcAreMode() {
+  const mode = state.alcFilters?.areMode || "target";
+  return ["target", "baixo", "medio", "alto"].includes(mode) ? mode : "target";
+}
+
+function currentAlcRisks() {
+  const risks = Array.isArray(state.alcFilters?.risks) ? state.alcFilters.risks : [];
+  return risks.filter((risk) => ["baixo", "medio", "alto", "critico"].includes(risk));
+}
+
+function getAlcCandidateSource() {
+  const plan = state.result?.relocationPlan;
+  if (!plan) {
+    return [];
+  }
+
+  const mode = currentAlcAreMode();
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
+  if (mode === "target") {
+    return targetPlan?.candidates?.length
+      ? targetPlan.candidates
+      : plan.spaceModes?.alto?.candidates || [];
+  }
+  return plan.spaceModes?.[mode]?.candidates || [];
+}
+
+function getAlcCandidates(options = {}) {
+  const source = getAlcCandidateSource();
+  const activeRisks = currentAlcRisks();
+  const applyRiskFilters = options.applyRiskFilters !== false;
+  const seen = new Set();
+  return source
+    .filter((item) => item && item.path && item.deletionDecision !== "nao_apagar")
+    .filter((item) => !applyRiskFilters || activeRisks.includes(item.risk || "baixo"))
+    .sort((a, b) => candidateBytes(b) - candidateBytes(a))
+    .filter((item) => {
+      if (seen.has(item.path)) {
+        return false;
+      }
+      seen.add(item.path);
+      return true;
+    })
+    .slice(0, 220);
+}
+
+function selectedAlcCandidates() {
+  const body = elements.alcModalBody;
+  if (!body) {
+    return [];
+  }
+  const selectedPaths = new Set(
+    Array.from(body.querySelectorAll("[data-alc-file]:checked")).map((input) => input.dataset.alcFile)
+  );
+  return getAlcCandidates().filter((item) => selectedPaths.has(item.path));
+}
+
+async function executeAlcRelocation() {
+  const body = elements.alcModalBody;
+  if (!body) {
+    return;
+  }
+
+  const targetKind = body.querySelector("input[name='alcTargetKind']:checked")?.value || "directory";
+  const targetDirectory = targetKind === "directory"
+    ? body.querySelector("#alcDestinationPath")?.value.trim()
+    : null;
+  const candidates = selectedAlcCandidates();
+  const userContentCount = candidates.filter(isLikelyUserContentCandidate).length;
+  const selectedBytes = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+
+  if (!candidates.length) {
+    showAlcResult(null, new Error("Selecione pelo menos um arquivo."));
+    return;
+  }
+
+  if (targetKind === "directory" && !targetDirectory) {
+    showAlcResult(null, new Error("Escolha a pasta de destino."));
+    return;
+  }
+
+  const actionLabel = targetKind === "trash" ? "enviar para a lixeira" : "mover para o destino";
+  const warning = userContentCount
+    ? `\n\nATENCAO: ${userContentCount} arquivo(s) parecem conteudo criado pelo usuario.`
+    : "";
+  const confirmed = window.confirm(`Confirmar A.L.C para ${actionLabel} ${candidates.length} arquivo(s), somando ${formatBytes(selectedBytes)}?${warning}`);
+  if (!confirmed) {
+    return;
+  }
+
+  const executeButton = body.querySelector("#executeAlcButton");
+  if (executeButton) {
+    executeButton.disabled = true;
+    executeButton.textContent = "Executando...";
+  }
+
+  let executionCompleted = false;
+  try {
+    const request = {
+      rootPath: state.result.rootPath || elements.rootPath.value.trim(),
+      targetKind,
+      targetDirectory,
+      files: candidates.map((item) => ({
+        relativePath: item.path,
+        size: candidateBytes(item),
+        userContent: isLikelyUserContentCandidate(item)
+      }))
+    };
+    const report = await fetchJson("/api/alc/relocate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request })
+    });
+    state.lastAlcReport = report;
+    appendSystemLog(`A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} realocados.`);
+    showAlcResult(report);
+    executionCompleted = true;
+  } catch (error) {
+    appendSystemLog(`Erro A.L.C: ${errorMessage(error)}`);
+    showAlcResult(null, error);
+  } finally {
+    if (executeButton) {
+      executeButton.textContent = "Executar A.L.C";
+      executeButton.disabled = executionCompleted;
+    }
+  }
+}
+
+function showAlcResult(report, error = null) {
+  const result = elements.alcModalBody?.querySelector("#alcResult");
+  if (!result) {
+    return;
+  }
+  result.classList.remove("is-hidden", "is-error");
+  if (error) {
+    result.classList.add("is-error");
+    result.innerHTML = `
+      <strong>Falha no A.L.C</strong>
+      <span>${escapeHtml(errorMessage(error))}</span>
+    `;
+    return;
+  }
+
+  result.innerHTML = `
+    <strong>A.L.C concluido</strong>
+    <span>${formatNumber(report.movedFiles || 0)} arquivo(s) realocados, ${formatBytes(report.movedBytes || 0)} retirados da raiz.</span>
+    <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o A.D.D/A.R.E.</span>
+  `;
+}
+
+function candidateBytes(item) {
+  return Number(item?.packageBytes || item?.sizeBytes || item?.bytes || 0);
+}
+
+function isLikelyUserContentCandidate(item) {
+  const path = String(item?.path || "").replace(/\\/g, "/").toLowerCase();
+  const extension = (path.match(/\.([a-z0-9_+-]+)$/)?.[1] || "").toLowerCase();
+  const userFolder = /(^|\/)(users|desktop|documents|downloads|pictures|videos|music|onedrive|ideaProjects|projects|workspace|repos)(\/|$)/i.test(path);
+  const personalExtension = new Set([
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "txt", "md", "rtf",
+    "jpg", "jpeg", "png", "gif", "webp", "psd", "kra", "clip",
+    "mp4", "mov", "mkv", "avi", "mp3", "wav", "flac",
+    "zip", "rar", "7z", "blend", "sai"
+  ]).has(extension);
+  const notObviouslyGenerated = !/(^|\/)(node_modules|target|build|dist|cache|tmp|temp|logs?)(\/|$)/i.test(path);
+  return notObviouslyGenerated && (userFolder || personalExtension || item?.userImpact === "alto");
 }
 
 function modeLabel(modeKey) {
@@ -2592,8 +3270,8 @@ function renderDependencies() {
           <tr>
             <td>${escapeHtml(edge.type)}</td>
             <td>${edge.line || "-"}</td>
-            <td class="path-cell">${escapeHtml(edge.sourcePath)}</td>
-            <td class="path-cell">${escapeHtml(edge.targetPath)}</td>
+            <td class="path-cell">${fileMapButton(edge.sourcePath)}</td>
+            <td class="path-cell">${fileMapButton(edge.targetPath)}</td>
             <td class="path-cell">${escapeHtml(edge.specifier)}</td>
           </tr>
         `).join("")}

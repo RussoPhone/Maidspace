@@ -30,7 +30,10 @@
           <h2>Varredura</h2>
           <label class="field">
             <span>Diretorio raiz</span>
-            <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
+            <div class="input-action-row">
+              <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
+              <button id="chooseRootButton" class="ghost-button" type="button" title="Escolher diretorio pelo explorador">Escolher</button>
+            </div>
           </label>
           <label class="field">
             <span>Meta livre (GB)</span>
@@ -103,7 +106,7 @@
             <span><b class="dot dot-medium"></b>medio</span>
             <span><b class="dot dot-high"></b>alto</span>
             <span><b class="dot dot-critical"></b>critico</span>
-            <span>clique para detalhes, botoes para visao, botao direito para mover</span>
+            <span>clique para detalhes, botoes para visao, scroll para zoom, botao direito para mover</span>
           </div>
         </section>
 
@@ -132,8 +135,9 @@
           <div class="dock-heading">
             <div>
               <h2>Estado A.L.C</h2>
-              <p>Comparacao com a ultima varredura salva para detectar mudancas futuras.</p>
+              <p>Execucao assistida: mover para destino escolhido ou enviar para a lixeira.</p>
             </div>
+            <button id="openAlcModal" class="ghost-button" type="button" disabled>Abrir A.L.C</button>
           </div>
           <div id="continuousState" class="state-grid"></div>
         </section>
@@ -194,6 +198,22 @@
         <div id="areModalBody" class="modal-body"></div>
       </section>
     </div>
+
+    <div id="alcModal" class="modal-shell is-hidden" role="dialog" aria-modal="true" aria-labelledby="alcModalTitle" aria-hidden="true">
+      <div class="modal-backdrop" data-close-modal="alc"></div>
+      <section class="modal-panel alc-modal-panel">
+        <header class="modal-header">
+          <div>
+            <h2 id="alcModalTitle">A.L.C</h2>
+            <p>Realocacao confirmada pelo usuario.</p>
+          </div>
+          <button id="closeAlcModal" class="ghost-button" type="button">Fechar</button>
+        </header>
+        <div id="alcModalBody" class="modal-body"></div>
+      </section>
+    </div>
+
+    <aside id="fileDependencyPopover" class="file-dependency-popover is-hidden" aria-live="polite"></aside>
 
     <script src="/app.js"></script>
   </body>
