@@ -89,6 +89,66 @@ const DOCUMENT_EXTENSIONS = new Set([
   ".xlsx"
 ]);
 
+const MEDIA_EXTENSIONS = new Set([
+  ".ai",
+  ".flac",
+  ".gif",
+  ".jpeg",
+  ".jpg",
+  ".mkv",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".png",
+  ".psd",
+  ".raw",
+  ".svg",
+  ".wav",
+  ".webp"
+]);
+
+const LOW_VALUE_EXTENSIONS = new Set([
+  ".cache",
+  ".chk",
+  ".crdownload",
+  ".dmp",
+  ".log",
+  ".old",
+  ".part",
+  ".temp",
+  ".tmp"
+]);
+
+const TEMPORARY_DOWNLOAD_EXTENSIONS = new Set([
+  ".crdownload",
+  ".part",
+  ".tmp"
+]);
+
+const APPLICATION_STATE_EXTENSIONS = new Set([
+  ".cfg",
+  ".conf",
+  ".crt",
+  ".dat",
+  ".db",
+  ".db3",
+  ".ini",
+  ".json",
+  ".kdbx",
+  ".key",
+  ".ost",
+  ".pem",
+  ".pfx",
+  ".plist",
+  ".prefs",
+  ".sqlite",
+  ".sqlite3",
+  ".wallet",
+  ".xml",
+  ".yaml",
+  ".yml"
+]);
+
 const BROAD_APPLICATION_PATHS = [
   "program files/",
   "program files (x86)/"
@@ -120,6 +180,8 @@ function classifyFileKnowledge(relativePath, fileName, extension, metadata = {})
   const normalizedName = String(fileName || "").toLowerCase();
   const normalizedExtension = String(extension || "").toLowerCase();
   const size = Number(metadata.size || 0);
+  const typeCategory = typeCategoryFor(normalizedName, normalizedExtension);
+  const pathSignals = detectPathSignals(normalizedPath, normalizedName, normalizedExtension, typeCategory);
 
   const categories = [];
   for (const [key, bucket] of Object.entries(knowledge)) {
@@ -133,9 +195,20 @@ function classifyFileKnowledge(relativePath, fileName, extension, metadata = {})
   if (isBroadApplicationPath(normalizedPath)) {
     categories.push("installedApplication");
   }
+  if (pathSignals.isKnownUserFolder) {
+    categories.push("knownUserFolder");
+  }
+  if (pathSignals.isCloudUserContent) {
+    categories.push("cloudUserContent");
+  }
+  if (pathSignals.isApplicationState) {
+    categories.push("applicationState");
+  }
+  if (pathSignals.isTemporaryDownload) {
+    categories.push("temporaryDownload");
+  }
 
-  const typeCategory = typeCategoryFor(normalizedName, normalizedExtension);
-  const riskCategory = riskCategoryFor(categories, typeCategory);
+  const riskCategory = riskCategoryFor(categories, typeCategory, pathSignals);
   const lastUseBucket = ageBucket(metadata.lastAccessedAt || metadata.accessedAt || metadata.modifiedAt);
   const createdBucket = ageBucket(metadata.createdAt || metadata.birthtime || metadata.modifiedAt);
   const modifiedBucket = ageBucket(metadata.modifiedAt);
@@ -153,9 +226,13 @@ function classifyFileKnowledge(relativePath, fileName, extension, metadata = {})
     categories,
     isSystemEssential: categories.includes("systemEssential"),
     isProjectDependency: categories.includes("projectDependency"),
-    isUserContent: categories.includes("userContent"),
-    isLowValueGenerated: categories.includes("lowValueGenerated"),
+    isUserContent: categories.includes("userContent") || pathSignals.isKnownUserFolder || pathSignals.isCloudUserContent,
+    isLowValueGenerated: categories.includes("lowValueGenerated") || typeCategory === "baixo_valor" || pathSignals.isTemporaryDownload,
     isInstalledApplication: categories.includes("installedApplication"),
+    isKnownUserFolder: pathSignals.isKnownUserFolder,
+    isCloudUserContent: pathSignals.isCloudUserContent,
+    isApplicationState: pathSignals.isApplicationState,
+    isTemporaryDownload: pathSignals.isTemporaryDownload,
     isArchive: typeCategory === "arquivo_compactado",
     isExecutable: typeCategory === "executavel",
     isSourceCode: typeCategory === "codigo_fonte",
@@ -183,18 +260,21 @@ function typeCategoryFor(normalizedName, normalizedExtension) {
   if (DOCUMENT_EXTENSIONS.has(normalizedExtension)) {
     return "documento_usuario";
   }
-  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".mp3", ".wav", ".flac", ".mp4", ".mov", ".mkv"].includes(normalizedExtension)) {
+  if (MEDIA_EXTENSIONS.has(normalizedExtension)) {
     return "midia_usuario";
   }
-  if ([".tmp", ".temp", ".log", ".cache", ".dmp", ".chk", ".crdownload", ".part"].includes(normalizedExtension)) {
+  if (LOW_VALUE_EXTENSIONS.has(normalizedExtension)) {
     return "baixo_valor";
   }
   return "desconhecido";
 }
 
-function riskCategoryFor(categories, typeCategory) {
+function riskCategoryFor(categories, typeCategory, pathSignals = {}) {
   if (categories.includes("systemEssential")) {
     return "sistema";
+  }
+  if (pathSignals.isApplicationState && typeCategory !== "baixo_valor") {
+    return "estado_aplicativo";
   }
   if (categories.includes("installedApplication") || typeCategory === "executavel") {
     return "aplicativo_instalado";
@@ -212,6 +292,31 @@ function riskCategoryFor(categories, typeCategory) {
     return "arquivo_pesado";
   }
   return "incerto";
+}
+
+function detectPathSignals(normalizedPath, normalizedName, normalizedExtension, typeCategory) {
+  const isKnownUserFolder = isKnownUserFolderPath(normalizedPath);
+  const isCloudUserContent = isCloudUserContentPath(normalizedPath);
+  const isAppDataPath = isApplicationDataPath(normalizedPath);
+  const isGeneratedPath = isGeneratedPathLike(normalizedPath);
+  const isTemporaryDownload = TEMPORARY_DOWNLOAD_EXTENSIONS.has(normalizedExtension)
+    && (isKnownUserFolder || /(^|\/)(downloads?|temp|tmp)(\/|$)/.test(normalizedPath) || typeCategory === "baixo_valor");
+  const isApplicationState = isAppDataPath
+    && !isGeneratedPath
+    && !isTemporaryDownload
+    && (
+      APPLICATION_STATE_EXTENSIONS.has(normalizedExtension)
+      || !["arquivo_compactado", "baixo_valor", "midia_usuario"].includes(typeCategory)
+    );
+
+  return {
+    isKnownUserFolder,
+    isCloudUserContent,
+    isApplicationState,
+    isTemporaryDownload,
+    isGeneratedPath,
+    normalizedName
+  };
 }
 
 function ageBucket(value) {
@@ -296,6 +401,22 @@ function isStrictSystemPath(normalizedPath) {
 
 function isBroadApplicationPath(normalizedPath) {
   return BROAD_APPLICATION_PATHS.some((fragment) => normalizedPath.includes(fragment));
+}
+
+function isKnownUserFolderPath(normalizedPath) {
+  return /(^|\/)((users\/[^/]+\/)?(desktop|documents|downloads|pictures|videos|music|favorites|contacts|saved games|links))(\/|$)/.test(normalizedPath);
+}
+
+function isCloudUserContentPath(normalizedPath) {
+  return /(^|\/)((users\/[^/]+\/)?(onedrive|dropbox|google drive|icloud drive|box|mega))(\/|$)/.test(normalizedPath);
+}
+
+function isApplicationDataPath(normalizedPath) {
+  return /(^|\/)((users\/[^/]+\/)?appdata\/(roaming|local|locallow)|programdata)(\/|$)/.test(normalizedPath);
+}
+
+function isGeneratedPathLike(normalizedPath) {
+  return /(^|\/)(cache|caches|tmp|temp|logs?|\.cache|crashdumps|dumps|shadercache|webcache|code cache|gpucache)(\/|$)/.test(normalizedPath);
 }
 
 function looksProjectLike(normalizedPath) {

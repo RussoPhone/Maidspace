@@ -15,6 +15,14 @@ const {
   loadPreviousState,
   saveCurrentState
 } = require("./src/alc/state");
+const {
+  applyPreferencesToAddReport,
+  loadRootPreferences,
+  saveExemptDirectories,
+  saveFileDecision,
+  saveTargetPreference
+} = require("./src/alc/preferences");
+const { scanRelocationCandidates } = require("./src/scan/fastInventory");
 const { generateSrcReport } = require("./src/report");
 
 const rootDirectory = __dirname;
@@ -41,6 +49,61 @@ function createAppServer() {
       if (request.method === "POST" && request.url === "/api/scan-progressive") {
         const body = await readJsonBody(request);
         return streamSrcPipeline(response, body.rootPath || rootDirectory, body.options || {});
+      }
+
+      if (request.method === "GET" && request.url.startsWith("/api/preferences")) {
+        const url = new URL(request.url, `http://${request.headers.host}`);
+        const rootPath = url.searchParams.get("rootPath") || defaultRootPath();
+        const preferences = await loadRootPreferences(rootPath);
+        return sendJson(response, 200, preferences);
+      }
+
+      if (request.method === "POST" && request.url === "/api/preferences/decision") {
+        const body = await readJsonBody(request);
+        const preferences = await saveFileDecision(
+          body.rootPath || defaultRootPath(),
+          body.relativePath,
+          body.decision,
+          body.metadata || {}
+        );
+        return sendJson(response, 200, preferences);
+      }
+
+      if (request.method === "POST" && request.url === "/api/preferences/exemptions") {
+        const body = await readJsonBody(request);
+        const preferences = await saveExemptDirectories(
+          body.rootPath || defaultRootPath(),
+          body.directories || []
+        );
+        return sendJson(response, 200, preferences);
+      }
+
+      if (request.method === "POST" && request.url === "/api/preferences/target") {
+        const body = await readJsonBody(request);
+        const preferences = await saveTargetPreference(
+          body.rootPath || defaultRootPath(),
+          body.targetFreeBytes
+        );
+        return sendJson(response, 200, preferences);
+      }
+
+      if (request.method === "POST" && request.url === "/api/alc/expand-candidates") {
+        const body = await readJsonBody(request);
+        const rootPath = body.rootPath || defaultRootPath();
+        const preferences = await loadRootPreferences(rootPath);
+        const result = await scanRelocationCandidates(rootPath, {
+          mode: body.mode || "alto",
+          targetBytes: body.targetBytes || 0,
+          limit: body.limit,
+          fastScanMs: body.fastScanMs,
+          preferences,
+          options: {
+            ...DEFAULT_OPTIONS,
+            includeProgramFiles: true
+          },
+          skipDirectories: DEFAULT_OPTIONS.skipDirectories || []
+        });
+        return sendJson(response, 200, result);
       }
 
       if (request.method !== "GET") {
@@ -71,15 +134,18 @@ async function* runSrcPipelineProgressive(rootPath, options = {}) {
 async function buildSrcResult(addReport, options = {}, { saveState = false, streamMode = false } = {}) {
   const isPartial = Boolean(addReport.progressive?.enabled && !addReport.progressive?.isFinal);
   const isTurboInventory = addReport.summary?.inventoryProvider && addReport.summary.inventoryProvider !== "node";
+  const preferences = await loadRootPreferences(addReport.rootPath);
+  applyPreferencesToAddReport(addReport, preferences);
+  const targetFreeBytes = Number(options.targetFreeBytes || preferences.targetFreeBytes || 0);
   const relocationPlan = generateRelocationPlan(addReport, streamMode ? {
     compact: true,
     candidateLimit: options.areCandidateLimit,
     packageLimit: options.arePackageLimit,
     blockedLimit: options.areBlockedLimit,
     operationLimit: options.areOperationLimit,
-    targetFreeBytes: options.targetFreeBytes
+    targetFreeBytes
   } : {
-    targetFreeBytes: options.targetFreeBytes
+    targetFreeBytes
   });
   const shouldBuildContinuousState = !isPartial && (!isTurboInventory || saveState || options.compareState === true);
   const currentState = shouldBuildContinuousState ? buildDirectoryState(addReport) : null;
@@ -126,6 +192,7 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
     },
     relocationPlan,
     continuousState,
+    preferences,
     report
   };
 }

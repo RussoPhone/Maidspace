@@ -2288,6 +2288,9 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
   const isFrequentlyUsed = node.daysSinceAccess <= options.frequentUseDaysThreshold;
   const isLowValueGenerated = Boolean(knowledge.isLowValueGenerated);
   const isUserContent = Boolean(knowledge.isUserContent);
+  const isKnownUserContent = Boolean(knowledge.isKnownUserFolder || knowledge.isCloudUserContent);
+  const isCloudUserContent = Boolean(knowledge.isCloudUserContent);
+  const isApplicationState = Boolean(knowledge.isApplicationState);
   const isInCycle = Boolean(node.inCycle);
   const isCentralDependency = node.incoming >= 8 || node.impactCount >= 16 || node.componentSize >= 25;
   const dependencyImpact = dependencyImpactFor(node);
@@ -2342,6 +2345,14 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     reasons.push("tipo gerado/cache de baixo valor");
     riskScore -= 14;
   }
+  if (isApplicationState && !isLowValueGenerated) {
+    reasons.push("estado de aplicativo em AppData/ProgramData");
+    riskScore += 42;
+  }
+  if (isKnownUserContent && !isLowValueGenerated) {
+    reasons.push(isCloudUserContent ? "conteudo de usuario em pasta sincronizada" : "conteudo em pasta conhecida do usuario");
+    riskScore += isCloudUserContent ? 40 : 35;
+  }
   if (isUserContent && isFrequentlyUsed) {
     reasons.push("conteudo do usuario usado nos ultimos 7 dias");
   }
@@ -2387,10 +2398,15 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     node.risk = "medio";
     node.relocationDecision = "averiguar";
   }
+  if ((isApplicationState || isKnownUserContent) && !isLowValueGenerated && node.risk === "baixo") {
+    node.risk = "medio";
+    node.simulationAction = isApplicationState ? "revisar_estado_de_aplicativo" : "revisar_conteudo_do_usuario";
+    node.relocationDecision = "averiguar";
+  }
 
   node.impact = {
     system: isSystemProtected ? "afeta_sistema" : isConfigProtected ? "protegido" : "nao_afeta_sistema",
-    user: userImpactFor(node, { isFrequentlyUsed, isUnused }),
+    user: userImpactFor(node, { isFrequentlyUsed, isUnused, isApplicationState, isKnownUserContent, isCloudUserContent, isLowValueGenerated }),
     dependencies: dependencyImpact
   };
   node.utilityStatus = utilityStatusFor(node, {
@@ -2400,6 +2416,9 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     isFrequentlyUsed,
     isLowValueGenerated,
     isUserContent,
+    isKnownUserContent,
+    isCloudUserContent,
+    isApplicationState,
     isInCycle,
     dependencyImpact
   });
@@ -2410,6 +2429,9 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     isFrequentlyUsed,
     isLowValueGenerated,
     isUserContent,
+    isKnownUserContent,
+    isCloudUserContent,
+    isApplicationState,
     isInCycle,
     dependencyImpact,
     dependencyLoad
@@ -2452,12 +2474,18 @@ function dependencyImpactFor(node) {
   return "nenhum";
 }
 
-function userImpactFor(node, { isFrequentlyUsed, isUnused }) {
+function userImpactFor(node, { isFrequentlyUsed, isUnused, isApplicationState, isKnownUserContent, isCloudUserContent, isLowValueGenerated }) {
   if (node.protectedReasons.length > 0) {
     return "alto";
   }
   if (node.inCycle) {
     return "medio";
+  }
+  if (isApplicationState && !isLowValueGenerated) {
+    return isFrequentlyUsed ? "alto" : "medio";
+  }
+  if ((isKnownUserContent || isCloudUserContent) && !isLowValueGenerated) {
+    return isFrequentlyUsed ? "alto" : "medio";
   }
   if (isFrequentlyUsed && node.fileKnowledge?.isUserContent) {
     return "alto";
@@ -2487,8 +2515,14 @@ function utilityStatusFor(node, context) {
   if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
     return context.isUnused ? "inutil_provavel" : "baixo_uso";
   }
+  if (context.isApplicationState && !context.isLowValueGenerated) {
+    return context.isFrequentlyUsed ? "usado_pelo_usuario" : "dependencia_relevante";
+  }
   if (context.isFrequentlyUsed && context.isUserContent) {
     return "usado_pelo_usuario";
+  }
+  if (context.isUserContent && !context.isLowValueGenerated) {
+    return context.isUnused ? "baixo_uso" : "utilidade_incerta";
   }
   if (context.dependencyImpact === "critico" || context.dependencyImpact === "alto" || context.dependencyImpact === "medio") {
     return "dependencia_relevante";
@@ -2509,8 +2543,14 @@ function deletionDecisionFor(node, context) {
   if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
     return context.isUnused ? "pode_apagar" : "inutil_provavel";
   }
+  if (context.isApplicationState && !context.isLowValueGenerated) {
+    return context.isFrequentlyUsed ? "nao_apagar" : "averiguar";
+  }
   if (context.isFrequentlyUsed && context.isUserContent) {
     return "nao_apagar";
+  }
+  if (context.isUserContent && !context.isLowValueGenerated) {
+    return context.isUnused ? "inutil_provavel" : "averiguar";
   }
   if (context.dependencyImpact === "critico" || context.dependencyImpact === "alto") {
     return "nao_apagar";

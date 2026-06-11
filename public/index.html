@@ -85,7 +85,7 @@
             <span>Buscar arquivo</span>
             <input id="fileSearch" class="search-input" type="search" placeholder="nome ou caminho">
           </label>
-          <p class="microcopy"> Hover</p>
+          <p class="microcopy">Clique no grafo para detalhes.</p>
         </section>
       </aside>
 
@@ -113,53 +113,46 @@
         <section class="decision-dock" aria-label="Fila de decisao para A.R.E">
           <div class="dock-heading">
             <div>
-              <h2>Fila A.R.E</h2>
-              <p>Resposta direta: pode apagar, parece inutil, precisa averiguar ou nao deve apagar.</p>
+              <h2>Riscos</h2>
+              <p>O que precisa da sua atenção.</p>
             </div>
           </div>
           <div id="simulationGrid" class="decision-grid"></div>
         </section>
 
-        <section class="data-dock" aria-label="Resumo A.R.E">
+        <section class="data-dock relocation-dock" aria-label="Painel de Relocação">
           <div class="dock-heading">
             <div>
-              <h2>Ganho espacial A.R.E</h2>
-              <p>Resumo do espaco realocavel.</p>
+              <h2>Painel de Relocação</h2>
+              <p>Meta, níveis A.R.E, fila A.L.C e decisões do usuário.</p>
             </div>
-            <button id="openAreModal" class="ghost-button" type="button" disabled>Abrir A.R.E</button>
+            <button id="openAreModal" class="ghost-button" type="button" disabled>Abrir Painel</button>
           </div>
           <div id="areSummary" class="plan-summary"></div>
-        </section>
-
-        <section class="data-dock" aria-label="Estado continuo">
-          <div class="dock-heading">
-            <div>
-              <h2>Estado A.L.C</h2>
-              <p>Execucao assistida: mover para destino escolhido ou enviar para a lixeira.</p>
-            </div>
-            <button id="openAlcModal" class="ghost-button" type="button" disabled>Abrir A.L.C</button>
-          </div>
-          <div id="continuousState" class="state-grid"></div>
+          <details>
+            <summary>Estado A.L.C</summary>
+            <div id="continuousState" class="state-grid"></div>
+          </details>
         </section>
 
         <section class="data-dock" aria-label="Profundidades lidas">
-          <div class="dock-heading">
-            <div>
-              <h2>Profundidades</h2>
-              <p>Memoria acumulada da varredura e ganho espacial estimado pelo A.R.E.</p>
-            </div>
-          </div>
-          <div id="depthTimeline" class="depth-timeline"></div>
+          <details>
+            <summary>Profundidades e memória da varredura</summary>
+            <div id="depthTimeline" class="depth-timeline"></div>
+          </details>
         </section>
 
         <section class="data-dock" aria-label="Dados da varredura">
           <div class="dock-heading">
             <div>
               <h2>Arquivos classificados</h2>
-              <p>Lista viva sincronizada com o grafo e o filtro de busca.</p>
+              <p>Use quando quiser investigar.</p>
             </div>
           </div>
-          <div id="filesTable" class="table-wrap"></div>
+          <details>
+            <summary>Lista de arquivos</summary>
+            <div id="filesTable" class="table-wrap"></div>
+          </details>
           <details>
             <summary>Dependencias detectadas</summary>
             <div id="dependenciesTable" class="table-wrap"></div>
@@ -187,29 +180,15 @@
 
     <div id="areModal" class="modal-shell is-hidden" role="dialog" aria-modal="true" aria-labelledby="areModalTitle" aria-hidden="true">
       <div class="modal-backdrop" data-close-modal="are"></div>
-      <section class="modal-panel are-modal-panel">
+      <section class="modal-panel are-modal-panel relocation-modal-panel">
         <header class="modal-header">
           <div>
-            <h2 id="areModalTitle">A.R.E</h2>
-            <p>Tricategorico.</p>
+            <h2 id="areModalTitle">Painel de Relocação</h2>
+            <p>A.R.E calcula. A.L.C move só com confirmação.</p>
           </div>
           <button id="closeAreModal" class="ghost-button" type="button">Fechar</button>
         </header>
         <div id="areModalBody" class="modal-body"></div>
-      </section>
-    </div>
-
-    <div id="alcModal" class="modal-shell is-hidden" role="dialog" aria-modal="true" aria-labelledby="alcModalTitle" aria-hidden="true">
-      <div class="modal-backdrop" data-close-modal="alc"></div>
-      <section class="modal-panel alc-modal-panel">
-        <header class="modal-header">
-          <div>
-            <h2 id="alcModalTitle">A.L.C</h2>
-            <p>Realocacao confirmada pelo usuario.</p>
-          </div>
-          <button id="closeAlcModal" class="ghost-button" type="button">Fechar</button>
-        </header>
-        <div id="alcModalBody" class="modal-body"></div>
       </section>
     </div>
 

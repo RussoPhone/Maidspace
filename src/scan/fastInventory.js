@@ -115,6 +115,285 @@ async function scanFastInventory(rootPath, options = {}, onProgress = null) {
   };
 }
 
+async function scanRelocationCandidates(rootPath, request = {}, onProgress = null) {
+  if (process.platform === "win32") {
+    return scanRelocationCandidatesWithRobocopy(rootPath, request, onProgress);
+  }
+
+  return scanRelocationCandidatesWithFs(rootPath, request, onProgress);
+}
+
+async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onProgress = null) {
+  const root = path.resolve(rootPath);
+  const destination = await fs.mkdtemp(path.join(os.tmpdir(), "maidspace-alc-null-"));
+  await fs.mkdir(destination, { recursive: true });
+
+  const mode = normalizeCleanupMode(request.mode || request.selectedMode || "alto");
+  const targetBytes = Math.max(0, Number(request.targetBytes || 0));
+  const maxMs = clampNumber(request.fastScanMs || request.maxMs, 1000, 30 * 60 * 1000, 10 * 60 * 1000);
+  const maxCandidates = clampNumber(request.limit, 1, Infinity, targetBytes ? 1000000 : 200000);
+  const options = {
+    ...request.options,
+    includeProgramFiles: request.options?.includeProgramFiles !== false
+  };
+  const excludedDirectories = Array.from(new Set([
+    destination,
+    ...((request.skipDirectories || options.skipDirectories || []).map((item) => String(item)).filter(Boolean))
+  ]));
+  const args = [
+    root,
+    destination,
+    "/L",
+    "/E",
+    "/BYTES",
+    "/FP",
+    "/TS",
+    "/XJ",
+    "/R:0",
+    "/W:0",
+    "/NJH",
+    "/NJS",
+    "/NP",
+    "/XD",
+    ...excludedDirectories
+  ];
+  const state = createFocusedCandidateState({ root, mode, targetBytes, maxCandidates, options, request });
+  let buffer = "";
+  let stopReason = null;
+  let settled = false;
+  const startedAt = Date.now();
+  let lastProgressAt = 0;
+  let lastPath = ".";
+
+  const child = spawn("robocopy", args, {
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const timer = setTimeout(() => {
+    stopReason = `Expansao A.L.C interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
+    killProcessTree(child);
+  }, maxMs);
+
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      consumeLine(line);
+    }
+  });
+
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString("utf8").trim();
+    if (text) {
+      state.warnings.push(text.slice(0, 300));
+    }
+  });
+
+  try {
+    await new Promise((resolve) => {
+      const hardTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        stopReason = stopReason || `Expansao A.L.C forcada a encerrar apos ${maxMs + 5000} ms; candidatos parciais mantidos.`;
+        killProcessTree(child);
+        resolve();
+      }, maxMs + 5000);
+
+      child.on("close", (code) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(hardTimer);
+        if (buffer.trim()) {
+          consumeLine(buffer);
+          buffer = "";
+        }
+        if (code >= 8 && !stopReason) {
+          stopReason = `Robocopy retornou codigo ${code}; expansao A.L.C parcial mantida.`;
+        }
+        resolve();
+      });
+
+      child.on("error", (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(hardTimer);
+        stopReason = `Falha ao iniciar expansao A.L.C: ${error.message}`;
+        resolve();
+      });
+    });
+  } finally {
+    clearTimeout(timer);
+    await fs.rm(destination, { recursive: true, force: true }).catch(() => {});
+  }
+
+  if (stopReason) {
+    state.warnings.push(stopReason);
+  }
+
+  return finalizeFocusedCandidateState(state, {
+    provider: "robocopy_focused_alc",
+    elapsedMs: Date.now() - startedAt,
+    stopReason
+  });
+
+  function consumeLine(rawLine) {
+    const line = rawLine.trim();
+    if (!line || state.complete) {
+      return;
+    }
+    const file = parseRobocopyFileLine(line);
+    if (!file) {
+      return;
+    }
+    const absolutePath = path.resolve(file.absolutePath);
+    const relativePath = normalizeRelative(path.relative(root, absolutePath));
+    if (!relativePath || relativePath.startsWith("..")) {
+      return;
+    }
+    const node = createInventoryNode({
+      root,
+      absolutePath,
+      relativePath,
+      size: file.size,
+      modifiedAt: file.modifiedAt,
+      options
+    });
+    lastPath = relativePath;
+    rememberFocusedCandidate(state, node);
+    emitProgress();
+    if (state.complete) {
+      stopReason = targetBytes
+        ? `Expansao A.L.C atingiu ${formatBytes(state.selectedBytes)} para meta ${formatBytes(targetBytes)}.`
+        : null;
+      killProcessTree(child);
+    }
+  }
+
+  function emitProgress() {
+    const now = Date.now();
+    if (!onProgress || now - lastProgressAt < 1000) {
+      return;
+    }
+    lastProgressAt = now;
+    onProgress({
+      provider: "robocopy_focused_alc",
+      phase: "expansao_alc",
+      mode,
+      currentPath: lastPath,
+      scannedFiles: state.scannedFiles,
+      eligibleFiles: state.eligibleFiles,
+      selectedFiles: state.selected.length,
+      selectedBytes: state.selectedBytes,
+      selectedHuman: formatBytes(state.selectedBytes),
+      targetBytes,
+      targetHuman: formatBytes(targetBytes),
+      elapsedMs: now - startedAt
+    });
+  }
+}
+
+async function scanRelocationCandidatesWithFs(rootPath, request = {}, onProgress = null) {
+  const root = path.resolve(rootPath);
+  const mode = normalizeCleanupMode(request.mode || request.selectedMode || "alto");
+  const targetBytes = Math.max(0, Number(request.targetBytes || 0));
+  const maxMs = clampNumber(request.fastScanMs || request.maxMs, 1000, 30 * 60 * 1000, 10 * 60 * 1000);
+  const maxCandidates = clampNumber(request.limit, 1, Infinity, targetBytes ? 1000000 : 200000);
+  const options = {
+    ...request.options,
+    includeProgramFiles: request.options?.includeProgramFiles !== false
+  };
+  const state = createFocusedCandidateState({ root, mode, targetBytes, maxCandidates, options, request });
+  const startedAt = Date.now();
+  let lastProgressAt = 0;
+  let lastPath = ".";
+  let stopReason = null;
+  const stack = [root];
+
+  while (stack.length && !state.complete) {
+    if (Date.now() - startedAt > maxMs) {
+      stopReason = `Expansao A.L.C interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
+      break;
+    }
+    const directory = stack.pop();
+    let entries = [];
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      state.warnings.push(`Sem acesso a ${directory}: ${error.message}`.slice(0, 300));
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (state.complete) {
+        break;
+      }
+      const absolutePath = path.join(directory, entry.name);
+      const relativePath = normalizeRelative(path.relative(root, absolutePath));
+      if (!relativePath || relativePath.startsWith("..") || focusedPathBlocked(relativePath, request)) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        stack.push(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      let metadata;
+      try {
+        metadata = await fs.stat(absolutePath);
+      } catch (error) {
+        state.warnings.push(`Sem metadados de ${relativePath}: ${error.message}`.slice(0, 300));
+        continue;
+      }
+      const node = createInventoryNode({
+        root,
+        absolutePath,
+        relativePath,
+        size: metadata.size,
+        modifiedAt: metadata.mtime instanceof Date ? metadata.mtime : new Date(),
+        options
+      });
+      lastPath = relativePath;
+      rememberFocusedCandidate(state, node);
+      const now = Date.now();
+      if (onProgress && now - lastProgressAt >= 1000) {
+        lastProgressAt = now;
+        onProgress({
+          provider: "fs_focused_alc",
+          phase: "expansao_alc",
+          mode,
+          currentPath: lastPath,
+          scannedFiles: state.scannedFiles,
+          eligibleFiles: state.eligibleFiles,
+          selectedFiles: state.selected.length,
+          selectedBytes: state.selectedBytes,
+          selectedHuman: formatBytes(state.selectedBytes),
+          targetBytes,
+          targetHuman: formatBytes(targetBytes),
+          elapsedMs: now - startedAt
+        });
+      }
+    }
+  }
+
+  return finalizeFocusedCandidateState(state, {
+    provider: "fs_focused_alc",
+    elapsedMs: Date.now() - startedAt,
+    stopReason
+  });
+}
+
 async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
   const root = path.resolve(rootPath);
   const destination = await fs.mkdtemp(path.join(os.tmpdir(), "src-robocopy-null-"));
@@ -660,22 +939,35 @@ function metadataCleanupMode(node) {
   const knowledge = node.fileKnowledge || {};
   const generatedPath = /(^|\/)(cache|caches|tmp|temp|logs?|\.cache|crashdumps|dumps|shadercache|webcache)(\/|$)/.test(relativePath);
   const generatedFile = knowledge.isLowValueGenerated || /\.(tmp|temp|log|bak|old|dmp|chk|crdownload|part)$/i.test(name);
+  const downloadsPath = /(^|\/)(downloads?|download)(\/|$)/.test(relativePath);
+  const archivePath = /(^|\/)(backup|backups|archive|archives)(\/|$)/.test(relativePath);
+  const knownUserPayload = knowledge.isUserContent || knowledge.isKnownUserFolder || knowledge.isCloudUserContent;
+  const applicationState = knowledge.isApplicationState && !generatedPath && !generatedFile;
   const archiveOrInstaller = knowledge.isArchive
     || [".zip", ".7z", ".rar", ".iso", ".msi", ".exe"].includes(extension)
     || /\b(setup|installer|install|driver)\b/.test(name);
-  const mediaOrUserPayload = knowledge.isUserContent
+  const mediaOrUserPayload = knownUserPayload
     || [".mp4", ".mov", ".mkv", ".avi", ".wav", ".flac", ".mp3", ".psd", ".ai", ".raw"].includes(extension);
   const appPayload = knowledge.isInstalledApplication
     && (/(^|\/)(steamapps|common|downloads|cache|shadercache|epic games|games|mods)(\/|$)/.test(relativePath) || size >= 256 * 1024 * 1024);
 
+  if (applicationState) {
+    return age >= 45 && size >= 1024 * 1024 * 1024 ? "alto" : null;
+  }
   if ((generatedPath || generatedFile) && age >= 7) {
     return "baixo";
   }
   if (generatedPath || generatedFile) {
     return "medio";
   }
-  if ((archiveOrInstaller || /(^|\/)(downloads|download|backup|backups|archive|archives)(\/|$)/.test(relativePath)) && age >= 21) {
+  if ((archiveOrInstaller || archivePath) && age >= 21) {
     return "medio";
+  }
+  if (downloadsPath && archiveOrInstaller && age >= 21) {
+    return "medio";
+  }
+  if ((downloadsPath || knowledge.isCloudUserContent) && knownUserPayload && (age >= 30 || size >= 1024 * 1024 * 1024)) {
+    return "alto";
   }
   if (appPayload || archiveOrInstaller || mediaOrUserPayload || size >= 1024 * 1024 * 1024) {
     return "alto";
@@ -909,6 +1201,9 @@ function fileRiskWeight(node) {
   if (knowledge.isProjectDependency || knowledge.isSourceCode) {
     score += 6;
   }
+  if (knowledge.isApplicationState) {
+    score += 5;
+  }
   if (knowledge.isArchive || knowledge.riskCategory === "arquivo_pesado") {
     score += 4;
   }
@@ -934,6 +1229,222 @@ function topDirectory(relativePath) {
     return ".";
   }
   return normalized.split("/")[0];
+}
+
+function createFocusedCandidateState({ root, mode, targetBytes, maxCandidates, options, request }) {
+  return {
+    root,
+    mode,
+    targetBytes,
+    maxCandidates,
+    options,
+    request,
+    scannedFiles: 0,
+    eligibleFiles: 0,
+    selectedBytes: 0,
+    selected: [],
+    skippedOversized: [],
+    warnings: [],
+    complete: false
+  };
+}
+
+function rememberFocusedCandidate(state, node) {
+  state.scannedFiles += 1;
+  const cleanupMode = metadataCleanupMode(node);
+  if (
+    !cleanupMode
+    || !cleanupModeIncludedIn(state.mode, cleanupMode)
+    || focusedCandidateBlocked(node, state.request)
+  ) {
+    return;
+  }
+
+  state.eligibleFiles += 1;
+  const candidate = inventoryNodeToRelocationCandidate(node, state.mode, cleanupMode, state.request);
+  const bytes = candidate.packageBytes || candidate.sizeBytes || 0;
+  if (!bytes) {
+    return;
+  }
+
+  const hasTarget = state.targetBytes > 0;
+  const remaining = state.targetBytes - state.selectedBytes;
+  if (
+    hasTarget
+    && remaining > 0
+    && bytes > remaining
+    && state.selectedBytes > 0
+  ) {
+    state.skippedOversized.push(candidate);
+    if (state.skippedOversized.length > 5000) {
+      state.skippedOversized.sort((a, b) => candidateBytesValue(a) - candidateBytesValue(b));
+      state.skippedOversized.length = 5000;
+    }
+    return;
+  }
+
+  state.selected.push(candidate);
+  state.selectedBytes += bytes;
+
+  if (state.selected.length >= state.maxCandidates) {
+    state.complete = true;
+    state.warnings.push(`Expansao A.L.C parou em ${state.maxCandidates} candidato(s).`);
+  } else if (hasTarget && state.selectedBytes >= state.targetBytes) {
+    state.complete = true;
+  }
+}
+
+function finalizeFocusedCandidateState(state, metadata) {
+  if (state.targetBytes > 0 && state.selectedBytes < state.targetBytes && state.skippedOversized.length) {
+    const best = state.skippedOversized
+      .slice()
+      .sort((a, b) => {
+        const aDelta = Math.abs(state.targetBytes - (state.selectedBytes + candidateBytesValue(a)));
+        const bDelta = Math.abs(state.targetBytes - (state.selectedBytes + candidateBytesValue(b)));
+        return aDelta - bDelta || candidateBytesValue(a) - candidateBytesValue(b);
+      })[0];
+    if (best && state.selected.length < state.maxCandidates) {
+      state.selected.push(best);
+      state.selectedBytes += candidateBytesValue(best);
+    }
+  }
+
+  state.selected.sort((a, b) => candidateBytesValue(b) - candidateBytesValue(a) || String(a.path).localeCompare(String(b.path)));
+
+  return {
+    provider: metadata.provider,
+    mode: state.mode,
+    targetBytes: state.targetBytes,
+    targetHuman: formatBytes(state.targetBytes),
+    bytes: state.selectedBytes,
+    human: formatBytes(state.selectedBytes),
+    files: state.selected.length,
+    scannedFiles: state.scannedFiles,
+    eligibleFiles: state.eligibleFiles,
+    complete: state.targetBytes <= 0 || state.selectedBytes >= state.targetBytes,
+    elapsedMs: metadata.elapsedMs || 0,
+    stopReason: metadata.stopReason || null,
+    warnings: state.warnings,
+    candidates: state.selected
+  };
+}
+
+function inventoryNodeToRelocationCandidate(node, selectedMode, cleanupMode, request = {}) {
+  const bytes = node.size || 0;
+  const decision = deletionDecisionForCleanupMode(cleanupMode, node);
+  const risk = riskForCleanupMode(cleanupMode, node);
+  const relativePath = normalizeRelative(node.relativePath);
+  const userDecision = focusedPreferenceDecision(relativePath, request);
+
+  return {
+    mode: selectedMode,
+    cleanupMode,
+    source: "focused_inventory",
+    path: relativePath,
+    sizeBytes: bytes,
+    sizeHuman: formatBytes(bytes),
+    packageBytes: bytes,
+    packageHuman: formatBytes(bytes),
+    packagePaths: [relativePath],
+    packageFileCount: 1,
+    targetDirectory: decision === "pode_apagar" ? "/lixeira_segura" : "/revisar/baixo_uso",
+    classification: node.classification || "isolado",
+    risk,
+    structuralRisk: risk,
+    deletionDecision: decision,
+    relocationDecision: "pode_mexer",
+    lastAccessedAt: node.lastAccessedAt,
+    lastModifiedAt: node.modifiedAt,
+    daysSinceAccess: node.daysSinceAccess,
+    incoming: 0,
+    outgoing: 0,
+    dependencyImpact: node.impact?.dependencies || "metadata",
+    userImpact: node.fileKnowledge?.isUserContent || node.fileKnowledge?.isKnownUserFolder ? "medio" : "baixo",
+    systemImpact: "nao_afeta_sistema",
+    spatialCategories: node.fileKnowledge?.categories || [],
+    justification: justificationForCleanupMode(cleanupMode, node),
+    requiresConfirmation: true,
+    userDecision: userDecision === "relocate" ? { action: "relocate" } : null
+  };
+}
+
+function deletionDecisionForCleanupMode(cleanupMode, node) {
+  if (cleanupMode === "baixo") {
+    return "pode_apagar";
+  }
+  if (cleanupMode === "medio") {
+    return node.fileKnowledge?.isLowValueGenerated ? "pode_apagar" : "inutil_provavel";
+  }
+  return "averiguar";
+}
+
+function riskForCleanupMode(cleanupMode, node) {
+  const knowledge = node.fileKnowledge || {};
+  if (cleanupMode === "baixo") {
+    return "baixo";
+  }
+  if (knowledge.isApplicationState || knowledge.isProjectDependency || knowledge.isSourceCode) {
+    return "alto";
+  }
+  return cleanupMode === "medio" ? "medio" : "medio";
+}
+
+function justificationForCleanupMode(cleanupMode, node) {
+  const knowledge = node.fileKnowledge || {};
+  if (cleanupMode === "baixo") {
+    return "inventario A.L.C: cache, temporario ou log de baixo uso";
+  }
+  if (cleanupMode === "medio") {
+    return "inventario A.L.C: arquivo gerado, pacote ou instalador de baixo uso";
+  }
+  if (knowledge.isUserContent || knowledge.isKnownUserFolder || knowledge.isCloudUserContent) {
+    return "inventario A.L.C: conteudo grande ou antigo para revisao";
+  }
+  if (knowledge.isInstalledApplication) {
+    return "inventario A.L.C: payload pesado de aplicativo/jogo";
+  }
+  return "inventario A.L.C: arquivo grande ou pouco usado para revisao";
+}
+
+function cleanupModeIncludedIn(selectedMode, cleanupMode) {
+  return CLEANUP_MODE_ORDER.indexOf(cleanupMode) <= CLEANUP_MODE_ORDER.indexOf(selectedMode);
+}
+
+function normalizeCleanupMode(mode) {
+  return CLEANUP_MODE_ORDER.includes(mode) ? mode : "alto";
+}
+
+function focusedCandidateBlocked(node, request = {}) {
+  const relative = normalizePreferencePath(node.relativePath);
+  if (focusedPathBlocked(relative, request)) {
+    return true;
+  }
+  return focusedPreferenceDecision(relative, request) === "ignore";
+}
+
+function focusedPathBlocked(relativePath, request = {}) {
+  const relative = normalizePreferencePath(relativePath);
+  if (!relative) {
+    return false;
+  }
+  const exemptDirectories = Object.keys(request.preferences?.exemptDirectories || request.exemptDirectories || {});
+  return exemptDirectories
+    .map(normalizePreferencePath)
+    .some((directory) => directory && (relative === directory || relative.startsWith(`${directory}/`)));
+}
+
+function focusedPreferenceDecision(relativePath, request = {}) {
+  const relative = normalizePreferencePath(relativePath);
+  const decisions = request.preferences?.fileDecisions || request.fileDecisions || {};
+  return decisions[relative]?.decision || null;
+}
+
+function normalizePreferencePath(value) {
+  return normalizeRelative(value).replace(/^\/+/, "").toLowerCase();
+}
+
+function candidateBytesValue(candidate) {
+  return Number(candidate?.packageBytes || candidate?.sizeBytes || candidate?.bytes || 0);
 }
 
 function isTextCandidate(lowerName, extension) {
@@ -1012,5 +1523,6 @@ function clampNumber(value, min, max, fallback) {
 }
 
 module.exports = {
-  scanFastInventory
+  scanFastInventory,
+  scanRelocationCandidates
 };

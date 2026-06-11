@@ -117,7 +117,10 @@ pub fn analyze_directory(root: &Path, options: AnalyzeOptions) -> anyhow::Result
         .with_context(|| format!("Diretorio nao encontrado: {}", root.display()))?;
 
     if !root.is_dir() {
-        return Err(anyhow!("O caminho informado nao e um diretorio: {}", root.display()));
+        return Err(anyhow!(
+            "O caminho informado nao e um diretorio: {}",
+            root.display()
+        ));
     }
 
     let mut directories = 0usize;
@@ -246,6 +249,8 @@ fn analyze_file(
         &protected_reasons,
         dependency_hint,
         days_since_access,
+        &relative,
+        &extension,
         options,
     );
     let deletion_decision = deletion_decision(utility_status, dependency_hint);
@@ -276,7 +281,9 @@ fn add_inventory_estimate(
     }
 
     let low_value = is_low_value_path(relative, extension);
+    let archive_or_installer = is_archive_or_installer(extension);
     let bulky_user_file = is_bulky_user_file(relative, extension);
+    let application_state = is_application_state_path(relative, extension) && !low_value;
     let stale = days_since_access >= options.unused_days_threshold;
     let not_hot = days_since_access > options.frequent_use_days_threshold;
 
@@ -284,7 +291,11 @@ fn add_inventory_estimate(
         inventory.baixo.add(bytes);
     }
 
-    if not_hot && (low_value || bulky_user_file || stale) && !protected_file_name(path) {
+    if not_hot
+        && !application_state
+        && (low_value || (archive_or_installer && stale) || (bulky_user_file && stale))
+        && !protected_file_name(path)
+    {
         inventory.medio.add(bytes);
     }
 
@@ -299,8 +310,10 @@ fn is_strict_system_file(path: &Path, relative: &str, extension: &str) -> bool {
 
 fn is_low_value_path(relative: &str, extension: &str) -> bool {
     let normalized = relative.replace('\\', "/").to_ascii_lowercase();
-    matches!(extension, "tmp" | "temp" | "log" | "bak" | "old" | "cache")
-        || normalized.contains("/cache/")
+    matches!(
+        extension,
+        "tmp" | "temp" | "log" | "bak" | "old" | "cache" | "dmp" | "chk" | "crdownload" | "part"
+    ) || normalized.contains("/cache/")
         || normalized.contains("/caches/")
         || normalized.contains("/tmp/")
         || normalized.contains("/temp/")
@@ -337,14 +350,121 @@ fn is_bulky_user_file(relative: &str, extension: &str) -> bool {
             | "jpeg"
             | "png"
             | "webp"
-    ) || normalized.contains("/downloads/")
-        || normalized.contains("/desktop/")
-        || normalized.contains("/videos/")
-        || normalized.contains("/pictures/")
-        || normalized.contains("/music/")
-        || normalized.contains("/backup/")
+    ) || normalized.contains("/backup/")
         || normalized.contains("/backups/")
         || normalized.contains("/archives/")
+}
+
+fn is_archive_or_installer(extension: &str) -> bool {
+    matches!(
+        extension,
+        "zip"
+            | "7z"
+            | "rar"
+            | "tar"
+            | "gz"
+            | "xz"
+            | "iso"
+            | "dmg"
+            | "msi"
+            | "exe"
+            | "pkg"
+            | "deb"
+            | "rpm"
+    )
+}
+
+fn is_user_content_path(relative: &str, extension: &str) -> bool {
+    let normalized = relative.replace('\\', "/").to_ascii_lowercase();
+    let in_user_area = [
+        "/desktop/",
+        "/documents/",
+        "/downloads/",
+        "/pictures/",
+        "/videos/",
+        "/music/",
+        "/onedrive/",
+        "/dropbox/",
+        "/google drive/",
+        "/icloud drive/",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+        || normalized.starts_with("desktop/")
+        || normalized.starts_with("documents/")
+        || normalized.starts_with("downloads/")
+        || normalized.starts_with("pictures/")
+        || normalized.starts_with("videos/")
+        || normalized.starts_with("music/")
+        || normalized.starts_with("onedrive/");
+
+    in_user_area
+        || matches!(
+            extension,
+            "csv"
+                | "doc"
+                | "docx"
+                | "md"
+                | "pdf"
+                | "ppt"
+                | "pptx"
+                | "rtf"
+                | "txt"
+                | "xls"
+                | "xlsx"
+                | "jpg"
+                | "jpeg"
+                | "png"
+                | "gif"
+                | "webp"
+                | "svg"
+                | "psd"
+                | "ai"
+                | "mp3"
+                | "wav"
+                | "flac"
+                | "mp4"
+                | "mov"
+                | "mkv"
+        )
+}
+
+fn is_application_state_path(relative: &str, extension: &str) -> bool {
+    let normalized = relative.replace('\\', "/").to_ascii_lowercase();
+    let in_app_data = normalized.contains("/appdata/roaming/")
+        || normalized.contains("/appdata/local/")
+        || normalized.contains("/appdata/locallow/")
+        || normalized.starts_with("appdata/roaming/")
+        || normalized.starts_with("appdata/local/")
+        || normalized.starts_with("appdata/locallow/")
+        || normalized.contains("/programdata/")
+        || normalized.starts_with("programdata/");
+
+    in_app_data
+        && matches!(
+            extension,
+            "cfg"
+                | "conf"
+                | "crt"
+                | "dat"
+                | "db"
+                | "db3"
+                | "ini"
+                | "json"
+                | "kdbx"
+                | "key"
+                | "ost"
+                | "pem"
+                | "pfx"
+                | "plist"
+                | "prefs"
+                | "sqlite"
+                | "sqlite3"
+                | "wallet"
+                | "xml"
+                | "yaml"
+                | "yml"
+        )
 }
 
 fn should_enter(entry: &DirEntry) -> bool {
@@ -376,14 +496,34 @@ fn build_provider_name_index(paths: &[PathBuf]) -> HashSet<String> {
         .collect()
 }
 
-fn dependency_hint(path: &Path, extension: &str, provider_names: &HashSet<String>) -> DependencyHint {
+fn dependency_hint(
+    path: &Path,
+    extension: &str,
+    provider_names: &HashSet<String>,
+) -> DependencyHint {
     if protected_file_name(path) {
         return DependencyHint::High;
     }
 
     if matches!(
         extension,
-        "dll" | "exe" | "sys" | "so" | "dylib" | "lock" | "toml" | "json"
+        "dll"
+            | "exe"
+            | "sys"
+            | "so"
+            | "dylib"
+            | "lock"
+            | "toml"
+            | "json"
+            | "db"
+            | "sqlite"
+            | "sqlite3"
+            | "dat"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "pem"
+            | "key"
     ) {
         return DependencyHint::Medium;
     }
@@ -409,6 +549,8 @@ fn utility_status(
     protected_reasons: &[String],
     dependency_hint: DependencyHint,
     days_since_access: u64,
+    relative: &str,
+    extension: &str,
     options: &AnalyzeOptions,
 ) -> UtilityStatus {
     if protected_reasons
@@ -420,13 +562,33 @@ fn utility_status(
     if !protected_reasons.is_empty() {
         return UtilityStatus::Protected;
     }
+    let low_value = is_low_value_path(relative, extension);
+    let user_content = is_user_content_path(relative, extension);
+    let application_state = is_application_state_path(relative, extension) && !low_value;
+
     if days_since_access <= options.frequent_use_days_threshold {
         return UtilityStatus::UsedByUser;
     }
-    if matches!(dependency_hint, DependencyHint::High | DependencyHint::Medium) {
+    if low_value && days_since_access >= options.unused_days_threshold {
+        return UtilityStatus::ProbablyUseless;
+    }
+    if application_state {
         return UtilityStatus::DependencyRelevant;
     }
-    if days_since_access >= options.unused_days_threshold && dependency_hint == DependencyHint::None {
+    if matches!(
+        dependency_hint,
+        DependencyHint::High | DependencyHint::Medium
+    ) {
+        return UtilityStatus::DependencyRelevant;
+    }
+    if user_content && days_since_access >= options.unused_days_threshold {
+        return UtilityStatus::LowUse;
+    }
+    if user_content {
+        return UtilityStatus::Uncertain;
+    }
+    if days_since_access >= options.unused_days_threshold && dependency_hint == DependencyHint::None
+    {
         return UtilityStatus::ProbablyUseless;
     }
     if days_since_access >= options.unused_days_threshold {
@@ -569,9 +731,25 @@ mod tests {
         fs::create_dir_all(root.join("Windows").join("Fonts")).unwrap();
         fs::create_dir_all(root.join("Users").join("demo").join("Videos")).unwrap();
 
-        create_sized_file(&root.join("Program Files (x86)").join("Steam").join("game.dat"), 20 * 1024 * 1024);
-        create_sized_file(&root.join("Windows").join("Fonts").join("system.dat"), 30 * 1024 * 1024);
-        create_sized_file(&root.join("Users").join("demo").join("Videos").join("clip.mp4"), 10 * 1024 * 1024);
+        create_sized_file(
+            &root
+                .join("Program Files (x86)")
+                .join("Steam")
+                .join("game.dat"),
+            20 * 1024 * 1024,
+        );
+        create_sized_file(
+            &root.join("Windows").join("Fonts").join("system.dat"),
+            30 * 1024 * 1024,
+        );
+        create_sized_file(
+            &root
+                .join("Users")
+                .join("demo")
+                .join("Videos")
+                .join("clip.mp4"),
+            10 * 1024 * 1024,
+        );
 
         let report = analyze_directory(
             &root,
@@ -586,10 +764,65 @@ mod tests {
 
         assert_eq!(report.summary.total_bytes, 60 * 1024 * 1024);
         assert!(report.summary.analyzed_bytes < report.summary.total_bytes);
-        assert_eq!(report.summary.inventory_reclaimable.alto.bytes, 30 * 1024 * 1024);
+        assert_eq!(
+            report.summary.inventory_reclaimable.alto.bytes,
+            30 * 1024 * 1024
+        );
         assert_eq!(report.summary.inventory_reclaimable.alto.files, 2);
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn user_content_and_app_state_are_not_safe_delete() {
+        let options = AnalyzeOptions {
+            max_files: 100,
+            max_depth: 16,
+            unused_days_threshold: 30,
+            frequent_use_days_threshold: 4,
+        };
+
+        let user_doc = utility_status(
+            &[],
+            DependencyHint::None,
+            90,
+            "Users/demo/Downloads/notes.txt",
+            "txt",
+            &options,
+        );
+        assert_eq!(user_doc, UtilityStatus::LowUse);
+        assert_ne!(
+            deletion_decision(user_doc, DependencyHint::None),
+            DeletionDecision::CanDelete
+        );
+
+        let app_state = utility_status(
+            &[],
+            DependencyHint::Medium,
+            90,
+            "Users/demo/AppData/Roaming/Editor/profile.sqlite",
+            "sqlite",
+            &options,
+        );
+        assert_eq!(app_state, UtilityStatus::DependencyRelevant);
+        assert_eq!(
+            deletion_decision(app_state, DependencyHint::Medium),
+            DeletionDecision::Review
+        );
+
+        let temp_file = utility_status(
+            &[],
+            DependencyHint::Low,
+            90,
+            "Users/demo/AppData/Local/Temp/cache.tmp",
+            "tmp",
+            &options,
+        );
+        assert_eq!(temp_file, UtilityStatus::ProbablyUseless);
+        assert_eq!(
+            deletion_decision(temp_file, DependencyHint::Low),
+            DeletionDecision::CanDelete
+        );
     }
 
     fn create_sized_file(path: &Path, bytes: u64) {

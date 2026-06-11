@@ -552,7 +552,7 @@ button:disabled {
 .are-summary-grid {
   display: grid;
   gap: 7px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .are-summary-card {
@@ -595,6 +595,10 @@ button:disabled {
   border-left: 4px solid #7f1d1d;
 }
 
+.are-summary-card-target {
+  border-left: 4px solid var(--accent);
+}
+
 .state-grid {
   grid-template-columns: repeat(8, minmax(90px, 1fr));
 }
@@ -602,8 +606,8 @@ button:disabled {
 .bucket {
   background: #f9fbfb;
   border: 1px solid var(--line);
-  min-height: 178px;
-  padding: 10px;
+  min-height: 132px;
+  padding: 8px;
 }
 
 .bucket h3 {
@@ -614,8 +618,8 @@ button:disabled {
 }
 
 .bucket ol {
-  margin: 10px 0 0;
-  max-height: 220px;
+  margin: 8px 0 0;
+  max-height: 128px;
   overflow: auto;
   padding-left: 18px;
 }
@@ -751,6 +755,10 @@ summary {
   top: 24px;
   transform: translateX(-50%);
   width: min(1180px, calc(100vw - 32px));
+}
+
+.relocation-modal-panel {
+  width: min(1240px, calc(100vw - 32px));
 }
 
 .modal-header {
@@ -933,7 +941,7 @@ summary {
 .alc-filter-grid {
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(180px, 0.75fr) minmax(0, 1.25fr);
+  grid-template-columns: minmax(160px, 1fr) minmax(150px, 0.8fr) minmax(180px, 1fr);
 }
 
 .alc-risk-filter {
@@ -1012,6 +1020,107 @@ summary {
   gap: 10px;
 }
 
+.alc-plan-board {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  padding: 10px;
+}
+
+.alc-plan-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.alc-plan-card {
+  background: #fff;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  display: grid;
+  gap: 5px;
+  min-height: 104px;
+  padding: 9px;
+  text-align: left;
+}
+
+.alc-plan-card:hover,
+.alc-plan-card.is-active {
+  background: #eef6f7;
+  border-color: var(--accent);
+}
+
+.alc-plan-card span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.alc-plan-card strong {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.alc-plan-card small,
+.alc-plan-card em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.alc-tab-row {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.alc-mini-explorer {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.alc-folder-grid {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.alc-folder-card {
+  background: #fff;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  display: grid;
+  gap: 4px;
+  min-height: 70px;
+  padding: 8px;
+  text-align: left;
+}
+
+.alc-folder-card:hover {
+  border-color: var(--accent);
+  background: #eef6f7;
+}
+
+.alc-folder-card span {
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.alc-folder-card strong {
+  font-size: 15px;
+}
+
+.alc-folder-card small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .alc-table-wrap {
   max-height: 360px;
 }
@@ -1019,6 +1128,48 @@ summary {
 .alc-table input[type="checkbox"] {
   min-height: auto;
   width: auto;
+}
+
+.relocation-target-board,
+.exemption-board {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.exemption-list {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  max-height: 110px;
+  overflow: auto;
+  padding: 0;
+}
+
+.exemption-list li {
+  align-items: center;
+  background: #fff;
+  border: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-height: 32px;
+  padding: 5px 6px;
+}
+
+.exemption-list span {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.file-agency-actions {
+  display: grid;
+  gap: 5px;
+  min-width: 86px;
 }
 
 .alc-user-warning {
@@ -1043,6 +1194,11 @@ summary {
 .alc-result.is-error {
   background: #fff0f0;
   border-left-color: var(--high);
+}
+
+.compact-action {
+  min-height: 28px;
+  padding: 4px 7px;
 }
 
 .file-map-link {
@@ -1112,6 +1268,11 @@ summary {
   color: var(--accent-dark);
   font-weight: 900;
   white-space: nowrap;
+}
+
+.file-map-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .file-map-facts {
@@ -1289,6 +1450,8 @@ summary {
   .are-simulation-grid,
   .alc-control-grid,
   .alc-filter-grid,
+  .alc-folder-grid,
+  .alc-plan-grid,
   .file-map-columns,
   .are-criteria-list {
     grid-template-columns: 1fr;

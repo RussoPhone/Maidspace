@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { analyzeDirectory } = require("../src/add/analyzer");
 const { generateRelocationPlan } = require("../src/are/planner");
+const { applyPreferencesToAddReport } = require("../src/alc/preferences");
 const { runSrcPipeline, runSrcPipelineProgressive } = require("../server");
 
 test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
@@ -15,9 +16,11 @@ test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   await fs.writeFile(path.join(root, "src", "style.css"), "body { color: #111; }\n");
   await fs.writeFile(path.join(root, "src", "orphan.txt"), "sem dependencia\n");
   await fs.writeFile(path.join(root, "src", "recent.tmp"), "temporario\n");
+  await fs.writeFile(path.join(root, "src", "old.log"), "log antigo\n");
   await fs.writeFile(path.join(root, "package.json"), "{\"scripts\":{\"start\":\"node src/app.js\"}}\n");
   const oldDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
   await fs.utimes(path.join(root, "src", "orphan.txt"), oldDate, oldDate);
+  await fs.utimes(path.join(root, "src", "old.log"), oldDate, oldDate);
 
   const result = await analyzeDirectory(root, {
     scanEngine: "node",
@@ -29,7 +32,7 @@ test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
 
   const byPath = new Map(result.nodes.map((node) => [node.relativePath, node]));
 
-  assert.equal(result.summary.files, 6);
+  assert.equal(result.summary.files, 7);
   assert.equal(result.summary.edges, 2);
   assert.equal(byPath.get("src/app.js").classification, "dicente");
   assert.equal(byPath.get("src/lib.js").classification, "docente");
@@ -38,9 +41,11 @@ test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   assert.equal(byPath.get("src/style.css").classification, "docente");
   assert.equal(byPath.get("src/orphan.txt").classification, "isolado");
   assert.equal(byPath.get("src/orphan.txt").risk, "baixo");
-  assert.equal(byPath.get("src/orphan.txt").deletionDecision, "pode_apagar");
-  assert.equal(byPath.get("src/orphan.txt").utilityStatus, "inutil_provavel");
+  assert.equal(byPath.get("src/orphan.txt").deletionDecision, "inutil_provavel");
+  assert.equal(byPath.get("src/orphan.txt").utilityStatus, "baixo_uso");
   assert.equal(byPath.get("src/orphan.txt").relocationDecision, "pode_mexer");
+  assert.equal(byPath.get("src/old.log").deletionDecision, "pode_apagar");
+  assert.equal(byPath.get("src/old.log").utilityStatus, "inutil_provavel");
   assert.equal(byPath.get("src/recent.tmp").deletionDecision, "inutil_provavel");
   assert.equal(byPath.get("src/recent.tmp").utilityStatus, "baixo_uso");
   assert.equal(byPath.get("package.json").classification, "critico_protegido");
@@ -52,6 +57,104 @@ test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   assert.equal(result.graphViews.close.nodes.length, result.summary.files);
   assert.ok(result.simulation.decisionGroups.pode_apagar.length >= 1);
   assert.ok(result.simulation.decisionGroups.nao_apagar.length >= 1);
+});
+
+test("A.D.D evita falsos positivos em conteudo do usuario e estado de aplicativo", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-user-safe-"));
+  await fs.mkdir(path.join(root, "Users", "me", "Downloads"), { recursive: true });
+  await fs.mkdir(path.join(root, "Users", "me", "AppData", "Roaming", "Editor"), { recursive: true });
+  await fs.mkdir(path.join(root, "Users", "me", "AppData", "Local", "Temp"), { recursive: true });
+  await fs.writeFile(path.join(root, "Users", "me", "Downloads", "notes.txt"), "anotacao pessoal\n");
+  await fs.writeFile(path.join(root, "Users", "me", "AppData", "Roaming", "Editor", "profile.sqlite"), Buffer.alloc(4096));
+  await fs.writeFile(path.join(root, "Users", "me", "AppData", "Local", "Temp", "cache.tmp"), Buffer.alloc(2048));
+  const oldDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+  await fs.utimes(path.join(root, "Users", "me", "Downloads", "notes.txt"), oldDate, oldDate);
+  await fs.utimes(path.join(root, "Users", "me", "AppData", "Roaming", "Editor", "profile.sqlite"), oldDate, oldDate);
+  await fs.utimes(path.join(root, "Users", "me", "AppData", "Local", "Temp", "cache.tmp"), oldDate, oldDate);
+
+  const result = await analyzeDirectory(root, {
+    scanEngine: "node",
+    dependencyMode: "metadata",
+    adaptive: false,
+    maxFiles: 100,
+    maxDepth: 8
+  });
+  const byPath = new Map(result.nodes.map((node) => [node.relativePath, node]));
+  const notes = byPath.get("Users/me/Downloads/notes.txt");
+  const profile = byPath.get("Users/me/AppData/Roaming/Editor/profile.sqlite");
+  const cache = byPath.get("Users/me/AppData/Local/Temp/cache.tmp");
+
+  assert.equal(notes.fileKnowledge.isKnownUserFolder, true);
+  assert.equal(notes.deletionDecision, "inutil_provavel");
+  assert.notEqual(notes.deletionDecision, "pode_apagar");
+  assert.equal(notes.risk, "medio");
+  assert.equal(profile.fileKnowledge.isApplicationState, true);
+  assert.equal(profile.deletionDecision, "averiguar");
+  assert.notEqual(profile.deletionDecision, "pode_apagar");
+  assert.equal(cache.fileKnowledge.isLowValueGenerated, true);
+  assert.equal(cache.deletionDecision, "pode_apagar");
+});
+
+test("Preferencias do usuario bloqueiam arquivos ignorados e pastas isentas", () => {
+  const addReport = {
+    rootPath: "C:/",
+    summary: {
+      totalBytes: 8192,
+      files: 2,
+      byDeletionDecision: {},
+      byRisk: {}
+    },
+    nodes: [
+      {
+        id: "file:Users/me/Downloads/old.iso",
+        kind: "file",
+        relativePath: "Users/me/Downloads/old.iso",
+        size: 4096,
+        risk: "baixo",
+        classification: "isolado",
+        deletionDecision: "pode_apagar",
+        relocationDecision: "pode_mexer",
+        protectedReasons: [],
+        riskReasons: [],
+        impact: { system: "nao_afeta_sistema", user: "baixo", dependencies: "nenhum" },
+        incoming: 0,
+        outgoing: 0,
+        impactCount: 0
+      },
+      {
+        id: "file:Users/me/Documents/work.db",
+        kind: "file",
+        relativePath: "Users/me/Documents/work.db",
+        size: 4096,
+        risk: "medio",
+        classification: "isolado",
+        deletionDecision: "averiguar",
+        relocationDecision: "averiguar",
+        protectedReasons: [],
+        riskReasons: [],
+        impact: { system: "nao_afeta_sistema", user: "medio", dependencies: "nenhum" },
+        incoming: 0,
+        outgoing: 0,
+        impactCount: 0
+      }
+    ],
+    edges: []
+  };
+
+  applyPreferencesToAddReport(addReport, {
+    fileDecisions: {
+      "users/me/downloads/old.iso": { decision: "ignore" }
+    },
+    exemptDirectories: {
+      "users/me/documents": { path: "users/me/documents" }
+    }
+  });
+  const plan = generateRelocationPlan(addReport);
+
+  assert.equal(addReport.nodes[0].deletionDecision, "nao_apagar");
+  assert.equal(addReport.nodes[1].deletionDecision, "nao_apagar");
+  assert.equal(plan.candidatesByMode.alto.some((item) => item.path === "Users/me/Downloads/old.iso"), false);
+  assert.equal(plan.candidatesByMode.alto.some((item) => item.path === "Users/me/Documents/work.db"), false);
 });
 
 test("A.D.D resolve import Python relativo", async () => {
@@ -369,8 +472,62 @@ test("A.R.E usa estimativa completa do inventario quando detalhes sao compactado
   assert.equal(plan.spaceModes.alto.reallocatableBytes, hundredGb);
   assert.equal(plan.spaceModes.alto.inventoryEstimateUsed, true);
   assert.equal(plan.spaceModes.alto.fileCount, 0);
+  assert.equal(plan.spaceModes.alto.executableFileCount, 120);
+  assert.equal(plan.spaceModes.alto.previewCandidateCount, 0);
   assert.equal(plan.summary.inventoryEstimatedReclaimableHuman.alto, "100 GB");
 });
+
+test("A.R.E monta meta personalizada por aproximacao sem mover nivel inteiro", () => {
+  const mb = 1024 * 1024;
+  const old = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+  const addReport = {
+    rootPath: "C:/",
+    summary: {
+      files: 3,
+      totalBytes: 145 * mb
+    },
+    nodes: [
+      relocationNode("cache/a.tmp", 70 * mb, old),
+      relocationNode("cache/b.tmp", 40 * mb, old),
+      relocationNode("cache/c.tmp", 35 * mb, old)
+    ],
+    cycles: []
+  };
+
+  const plan = generateRelocationPlan(addReport, { targetFreeBytes: 100 * mb });
+
+  assert.equal(plan.targetPlan.selectedMode, "baixo");
+  assert.equal(plan.targetPlan.status, "atingivel");
+  assert.equal(plan.targetPlan.plannedBytes, 105 * mb);
+  assert.deepEqual(plan.targetPlan.candidates.map((item) => item.path).sort(), ["cache/a.tmp", "cache/c.tmp"]);
+});
+
+function relocationNode(relativePath, size, timestamp) {
+  return {
+    id: `file:${relativePath}`,
+    kind: "file",
+    name: path.basename(relativePath),
+    relativePath,
+    extension: path.extname(relativePath),
+    size,
+    modifiedAt: timestamp,
+    lastAccessedAt: timestamp,
+    daysSinceAccess: 90,
+    classification: "isolado",
+    risk: "baixo",
+    deletionDecision: "pode_apagar",
+    relocationDecision: "pode_mexer",
+    protectedReasons: [],
+    fileKnowledge: { isLowValueGenerated: true, isUserContent: false },
+    impact: { system: "nao_afeta_sistema", user: "baixo", dependencies: "nenhum" },
+    incoming: 0,
+    outgoing: 0,
+    impactCount: 0,
+    componentId: `file:${relativePath}`,
+    inCycle: false,
+    unresolvedDependencies: 0
+  };
+}
 
 test("A.D.D agrupa DPN em HF e usa DFS limitado apenas em alvo de risco", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-hf-dpn-"));

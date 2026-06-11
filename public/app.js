@@ -22,12 +22,27 @@ const state = {
   lastAlcReport: null,
   alcFilters: {
     areMode: "target",
-    risks: ["baixo", "medio", "alto", "critico"]
+    risks: ["baixo", "medio", "alto", "critico"],
+    view: "all",
+    decision: "all",
+    search: ""
   },
   alcDraft: {
     targetKind: "directory",
     targetDirectory: ""
-  }
+  },
+  alcSelection: {
+    mode: "default",
+    overrides: {}
+  },
+  alcExpandedCandidates: {},
+  alcExpansionStatus: null,
+  preferences: {
+    fileDecisions: {},
+    exemptDirectories: {},
+    targetFreeBytes: 0
+  },
+  exemptionDraft: []
 };
 
 const labels = {
@@ -122,8 +137,8 @@ const elements = {
   areModalBody: document.querySelector("#areModalBody"),
   openAlcModal: document.querySelector("#openAlcModal"),
   closeAlcModal: document.querySelector("#closeAlcModal"),
-  alcModal: document.querySelector("#alcModal"),
-  alcModalBody: document.querySelector("#alcModalBody"),
+  alcModal: document.querySelector("#alcModal") || document.querySelector("#areModal"),
+  alcModalBody: document.querySelector("#alcModalBody") || document.querySelector("#areModalBody"),
   continuousState: document.querySelector("#continuousState"),
   depthTimeline: document.querySelector("#depthTimeline"),
   dependenciesTable: document.querySelector("#dependenciesTable"),
@@ -145,6 +160,7 @@ async function init() {
     if (elements.targetFreeGb) {
       elements.targetFreeGb.value = bytesToWholeGb(health.defaultOptions.targetFreeBytes || 0);
     }
+    await loadUserPreferences();
     setStatus(isNativeMaidSpace() ? "local" : "fallback local", "ok");
   } catch (error) {
     setStatus("servidor indisponível", "error");
@@ -193,12 +209,12 @@ function bindEvents() {
     if (event.key !== "Escape") {
       return;
     }
-    if (elements.alcModal && !elements.alcModal.classList.contains("is-hidden")) {
-      closeAlcModal();
-      return;
-    }
     if (elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
       closeAreModal();
+      return;
+    }
+    if (elements.alcModal && !elements.alcModal.classList.contains("is-hidden")) {
+      closeAlcModal();
     }
   });
 
@@ -251,15 +267,24 @@ async function runScan() {
   appendSystemLog(isNativeMaidSpace() ? "MaidSpace local iniciado." : "MaidSpace fallback iniciado.");
 
   try {
+    await loadUserPreferences(rootPath, { quiet: true });
+    await saveTargetPreference(targetFreeBytesFromInput(), { quiet: true });
     state.result = await fetchJson("/api/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rootPath, options })
     });
+    if (state.result.preferences) {
+      state.preferences = normalizePreferences(state.result.preferences);
+      state.exemptionDraft = Object.keys(state.preferences.exemptDirectories || {});
+    }
     resetGraphCache();
     state.selectedNodeId = null;
     state.hoveredNodeId = null;
     state.graphPan = { x: 0, y: 0 };
+    state.alcSelection = { mode: "default", overrides: {} };
+    state.alcExpandedCandidates = {};
+    state.alcExpansionStatus = null;
     elements.exportButton.disabled = false;
     syncOptionsFromResult();
     setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
@@ -295,11 +320,176 @@ function syncOptionsFromResult() {
   }
 }
 
+async function loadUserPreferences(rootPath = elements.rootPath?.value?.trim(), options = {}) {
+  if (!rootPath) {
+    return state.preferences;
+  }
+  try {
+    const preferences = await fetchJson(`/api/preferences?rootPath=${encodeURIComponent(rootPath)}`);
+    state.preferences = normalizePreferences(preferences);
+    state.exemptionDraft = Object.keys(state.preferences.exemptDirectories || {});
+    if (state.preferences.targetFreeBytes && elements.targetFreeGb && !Number(elements.targetFreeGb.value || 0)) {
+      elements.targetFreeGb.value = bytesToWholeGb(state.preferences.targetFreeBytes);
+    }
+  } catch (error) {
+    state.preferences = loadPreferencesFromLocalStorage(rootPath);
+    state.exemptionDraft = Object.keys(state.preferences.exemptDirectories || {});
+    if (!options.quiet) {
+      appendSystemLog(`Preferencias locais: ${errorMessage(error)}`);
+    }
+  }
+  return state.preferences;
+}
+
+async function saveFilePreference(relativePath, decision, metadata = {}) {
+  const rootPath = state.result?.rootPath || elements.rootPath.value.trim();
+  if (!rootPath || !relativePath) {
+    return;
+  }
+  state.alcExpandedCandidates = {};
+  state.alcExpansionStatus = null;
+  try {
+    state.preferences = normalizePreferences(await fetchJson("/api/preferences/decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootPath, relativePath, decision, metadata })
+    }));
+  } catch (error) {
+    state.preferences = saveLocalFilePreference(rootPath, relativePath, decision, metadata);
+    appendSystemLog(`Preferencia salva no navegador: ${errorMessage(error)}`);
+  }
+  applyPreferenceToCurrentResult(relativePath, decision);
+  renderAll();
+  if (elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
+    elements.areModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
+    wireAlcModalControls();
+  }
+}
+
+async function saveExemptionPreferences(directories) {
+  const rootPath = state.result?.rootPath || elements.rootPath.value.trim();
+  const normalized = Array.from(new Set((directories || []).map(normalizeRelativePath).filter(Boolean)));
+  state.exemptionDraft = normalized;
+  state.alcExpandedCandidates = {};
+  state.alcExpansionStatus = null;
+  try {
+    state.preferences = normalizePreferences(await fetchJson("/api/preferences/exemptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootPath, directories: normalized })
+    }));
+  } catch (error) {
+    state.preferences = saveLocalExemptions(rootPath, normalized);
+    appendSystemLog(`Isencoes salvas no navegador: ${errorMessage(error)}`);
+  }
+  appendSystemLog(`Pastas isentas: ${formatNumber(normalized.length)}.`);
+  renderAll();
+  if (elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
+    elements.areModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
+    wireAlcModalControls();
+  }
+}
+
+async function saveTargetPreference(targetFreeBytes, options = {}) {
+  const rootPath = state.result?.rootPath || elements.rootPath?.value?.trim();
+  if (!rootPath) {
+    return;
+  }
+  try {
+    state.preferences = normalizePreferences(await fetchJson("/api/preferences/target", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootPath, targetFreeBytes })
+    }));
+  } catch (error) {
+    state.preferences = saveLocalTarget(rootPath, targetFreeBytes);
+    if (!options.quiet) {
+      appendSystemLog(`Meta salva no navegador: ${errorMessage(error)}`);
+    }
+  }
+}
+
+function normalizePreferences(preferences = {}) {
+  return {
+    fileDecisions: preferences.fileDecisions || {},
+    exemptDirectories: preferences.exemptDirectories || {},
+    targetFreeBytes: Number(preferences.targetFreeBytes || 0),
+    updatedAt: preferences.updatedAt || null
+  };
+}
+
+function preferenceStorageKey(rootPath) {
+  return `maidspace:prefs:${String(rootPath || "").replace(/\\/g, "/").toLowerCase()}`;
+}
+
+function loadPreferencesFromLocalStorage(rootPath) {
+  try {
+    return normalizePreferences(JSON.parse(localStorage.getItem(preferenceStorageKey(rootPath)) || "{}"));
+  } catch {
+    return normalizePreferences();
+  }
+}
+
+function writeLocalPreferences(rootPath, preferences) {
+  const normalized = normalizePreferences(preferences);
+  localStorage.setItem(preferenceStorageKey(rootPath), JSON.stringify(normalized));
+  return normalized;
+}
+
+function saveLocalFilePreference(rootPath, relativePath, decision, metadata = {}) {
+  const preferences = loadPreferencesFromLocalStorage(rootPath);
+  const key = normalizeRelativePath(relativePath);
+  if (decision === "clear") {
+    delete preferences.fileDecisions[key];
+  } else {
+    preferences.fileDecisions[key] = {
+      decision,
+      updatedAt: new Date().toISOString(),
+      size: Number(metadata.size || 0)
+    };
+  }
+  return writeLocalPreferences(rootPath, preferences);
+}
+
+function saveLocalExemptions(rootPath, directories) {
+  const preferences = loadPreferencesFromLocalStorage(rootPath);
+  preferences.exemptDirectories = Object.fromEntries((directories || []).map((item) => [item, {
+    path: item,
+    updatedAt: new Date().toISOString()
+  }]));
+  return writeLocalPreferences(rootPath, preferences);
+}
+
+function saveLocalTarget(rootPath, targetFreeBytes) {
+  const preferences = loadPreferencesFromLocalStorage(rootPath);
+  preferences.targetFreeBytes = Number(targetFreeBytes || 0);
+  return writeLocalPreferences(rootPath, preferences);
+}
+
+function applyPreferenceToCurrentResult(relativePath, decision) {
+  const key = normalizeRelativePath(relativePath);
+  const node = (state.result?.nodes || []).find((item) => normalizeRelativePath(item.relativePath) === key);
+  if (!node) {
+    return;
+  }
+  if (decision === "ignore") {
+    node.deletionDecision = "nao_apagar";
+    node.relocationDecision = "nao_mover";
+    node.risk = node.risk === "critico" ? "critico" : "alto";
+    node.protectedReasons = Array.from(new Set([...(node.protectedReasons || []), "ignorado pelo usuario"]));
+    node.riskReasons = Array.from(new Set([...(node.riskReasons || []), "ignorado pelo usuario"]));
+  } else if (decision === "relocate") {
+    node.userDecision = { action: "relocate", updatedAt: new Date().toISOString() };
+    node.riskReasons = Array.from(new Set([...(node.riskReasons || []), "aprovado pelo usuario para realocacao"]));
+  }
+}
+
 async function chooseRootDirectory() {
   try {
     const directory = await pickDirectory("Cole o caminho da pasta raiz para varrer:");
     if (directory) {
       elements.rootPath.value = directory;
+      await loadUserPreferences(directory, { quiet: true });
       appendSystemLog(`Diretorio raiz definido: ${directory}`);
     }
   } catch (error) {
@@ -356,6 +546,48 @@ async function fetchNative(url, options = {}) {
         request: body.request
       });
     }
+    if (url === "/api/alc/expand-candidates") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("expand_alc_candidates", {
+        request: body
+      });
+    }
+    if (url === "/api/open-in-explorer") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("reveal_in_explorer", {
+        rootPath: body.rootPath,
+        relativePath: body.relativePath
+      });
+    }
+    if (url === "/api/preferences/decision") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("save_file_decision", {
+        rootPath: body.rootPath,
+        relativePath: body.relativePath,
+        decision: body.decision,
+        metadata: body.metadata || null
+      });
+    }
+    if (url === "/api/preferences/exemptions") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("save_exempt_directories", {
+        rootPath: body.rootPath,
+        directories: body.directories || []
+      });
+    }
+    if (url === "/api/preferences/target") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("save_target_preference", {
+        rootPath: body.rootPath,
+        targetFreeBytes: body.targetFreeBytes || 0
+      });
+    }
+    if (url.startsWith("/api/preferences")) {
+      const rootPath = new URL(url, "http://maidspace.local").searchParams.get("rootPath")
+        || elements.rootPath?.value?.trim()
+        || "";
+      return await invoke("load_preferences", { rootPath });
+    }
   } catch (error) {
     throw asError(error);
   }
@@ -409,6 +641,7 @@ function nativeReportToResult(scan, rootPath, options = {}) {
   const report = scan.report || scan;
   const files = report.files || [];
   const nodes = files.map((file, index) => nativeFileToNode(file, index));
+  applyClientPreferencesToNodes(nodes, state.preferences);
   const totalBytes = Number(report.summary?.total_bytes ?? files.reduce((sum, file) => sum + Number(file.size || 0), 0));
   const summary = {
     scannedAt: new Date().toISOString(),
@@ -516,6 +749,33 @@ function nativeReportToResult(scan, rootPath, options = {}) {
       text: `# MaidSpace\n\nInventario local Rust: ${formatNumber(summary.files)} arquivo(s), ${summary.totalHuman}. Meta: ${formatBytes(targetFreeBytes)}.`
     }
   };
+}
+
+function applyClientPreferencesToNodes(nodes, preferences = {}) {
+  const fileDecisions = preferences.fileDecisions || {};
+  const exemptDirectories = Object.keys(preferences.exemptDirectories || {});
+  for (const node of nodes) {
+    const relative = normalizeRelativePath(node.relativePath);
+    const decision = fileDecisions[relative]?.decision;
+    if (decision === "ignore" || isPathInsideAny(relative, exemptDirectories)) {
+      node.protectedReasons = Array.from(new Set([
+        ...(node.protectedReasons || []),
+        decision === "ignore" ? "ignorado pelo usuario" : "pasta isenta pelo usuario"
+      ]));
+      node.deletionDecision = "nao_apagar";
+      node.relocationDecision = "nao_mover";
+      node.risk = node.risk === "critico" ? "critico" : "alto";
+      node.classification = "critico_protegido";
+      node.impact = {
+        ...(node.impact || {}),
+        system: "protegido",
+        user: "alto"
+      };
+    } else if (decision === "relocate") {
+      node.userDecision = { action: "relocate", updatedAt: fileDecisions[relative]?.updatedAt || null };
+      node.riskReasons = Array.from(new Set([...(node.riskReasons || []), "aprovado pelo usuario para realocacao"]));
+    }
+  }
 }
 
 function nativeFileToNode(file, index) {
@@ -627,6 +887,9 @@ function buildNativeRelocationPlan(nodes, summary, targetFreeBytes, rootPath = "
       inventoryEstimatedHuman: formatBytes(estimatedBytes),
       inventoryEstimatedFiles: estimatedFiles,
       inventoryEstimateUsed: estimatedBytes > detailedBytes,
+      detailedFileCount: modes[mode].length,
+      previewCandidateCount: candidates.length,
+      executableFileCount: Math.max(modes[mode].length, estimatedFiles, candidates.length),
       fileCount: Math.max(candidates.length, estimatedFiles),
       packageCount: Math.max(candidates.length, estimatedFiles),
       packageFileCount: Math.max(candidates.length, estimatedFiles),
@@ -769,17 +1032,11 @@ function buildNativeTargetPlan(spaceModes, targetFreeBytes) {
     if (modeData.reallocatableBytes < targetFreeBytes) {
       continue;
     }
-    let total = 0;
-    const selected = [];
-    for (const item of modeData.candidates) {
-      if (total >= targetFreeBytes) {
-        break;
-      }
-      selected.push(item);
-      total += item.packageBytes || item.sizeBytes || 0;
-    }
+    const selected = selectApproximateCandidatesClient(modeData.candidates, targetFreeBytes);
+    const total = selected.reduce((sum, item) => sum + (item.packageBytes || item.sizeBytes || 0), 0);
     const enoughFromDetailedList = total >= targetFreeBytes;
-    const plannedBytes = enoughFromDetailedList ? total : modeData.reallocatableBytes;
+    const hasApproximation = total > 0;
+    const plannedBytes = hasApproximation ? total : modeData.reallocatableBytes;
     return {
       targetBytes: targetFreeBytes,
       targetHuman: formatBytes(targetFreeBytes),
@@ -788,9 +1045,11 @@ function buildNativeTargetPlan(spaceModes, targetFreeBytes) {
       plannedHuman: formatBytes(plannedBytes),
       selectedFiles: selected.length,
       candidates: selected,
-      status: enoughFromDetailedList ? "atingivel" : "estimativa_exige_mais_detalhe",
+      status: enoughFromDetailedList ? "atingivel" : hasApproximation ? "aproximado" : "estimativa_exige_mais_detalhe",
       statusText: enoughFromDetailedList
         ? `usar nivel ${mode} libera aproximadamente ${formatBytes(total)} com ${selected.length} arquivo(s).`
+        : hasApproximation
+          ? `nivel ${mode} chega perto da meta: ${formatBytes(total)} com ${selected.length} arquivo(s).`
         : `nivel ${mode} estima ${modeData.reallocatableHuman}; a lista detalhada foi compactada e o A.L.C deve confirmar os candidatos finais.`
     };
   }
@@ -805,6 +1064,48 @@ function buildNativeTargetPlan(spaceModes, targetFreeBytes) {
     status: "insuficiente",
     statusText: `o inventario local encontrou ${spaceModes.alto.reallocatableHuman}; abaixo da meta.`
   };
+}
+
+function selectApproximateCandidatesClient(candidates, targetBytes) {
+  const ordered = (candidates || [])
+    .slice()
+    .sort((a, b) => (b.packageBytes || b.sizeBytes || 0) - (a.packageBytes || a.sizeBytes || 0));
+  const selected = [];
+  const skipped = [];
+  let total = 0;
+
+  for (const item of ordered) {
+    const bytes = item.packageBytes || item.sizeBytes || 0;
+    if (!bytes || total >= targetBytes) {
+      continue;
+    }
+    const underBy = targetBytes - total;
+    if (bytes <= underBy) {
+      selected.push(item);
+      total += bytes;
+    } else {
+      skipped.push(item);
+    }
+  }
+
+  if (total >= targetBytes || !skipped.length) {
+    return selected;
+  }
+
+  let best = null;
+  let bestDelta = Math.abs(targetBytes - total);
+  for (const item of skipped) {
+    const bytes = item.packageBytes || item.sizeBytes || 0;
+    const delta = Math.abs(targetBytes - (total + bytes));
+    if (delta < bestDelta) {
+      best = item;
+      bestDelta = delta;
+    }
+  }
+  if (best) {
+    selected.push(best);
+  }
+  return selected;
 }
 
 function buildNativeRelocationSimulation(spaceModes, totalBytes, blockedFiles) {
@@ -1114,10 +1415,10 @@ function renderEmpty() {
   elements.filesTable.innerHTML = empty("Nenhuma varredura executada.");
   elements.dependenciesTable.innerHTML = empty("Nenhuma dependência detectada ainda.");
   elements.simulationGrid.innerHTML = "";
-  if (elements.areSummary) elements.areSummary.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
-  if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
+  if (elements.areSummary) elements.areSummary.innerHTML = empty("Execute uma varredura para calcular a relocacao.");
+  if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para abrir o Painel de Relocação.");
   if (elements.openAreModal) elements.openAreModal.disabled = true;
-  if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty("Execute uma varredura para preparar o A.L.C.");
+  if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty("Execute uma varredura para preparar o A.L.C.");
   if (elements.openAlcModal) elements.openAlcModal.disabled = true;
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado.");
@@ -1136,7 +1437,7 @@ function renderError(message) {
   if (elements.areSummary) elements.areSummary.innerHTML = empty(message);
   if (elements.areModalBody) elements.areModalBody.innerHTML = empty(message);
   if (elements.openAreModal) elements.openAreModal.disabled = true;
-  if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty(message);
+  if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty(message);
   if (elements.openAlcModal) elements.openAlcModal.disabled = true;
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty(message);
@@ -2014,6 +2315,12 @@ function stopGraphPan() {
 }
 
 function clearNodeSelectionOnOutsideClick(event) {
+  const explorerTrigger = event.target.closest?.("[data-open-explorer]");
+  if (explorerTrigger) {
+    openFileInExplorer(explorerTrigger.dataset.openExplorer);
+    return;
+  }
+
   const fileMapTrigger = event.target.closest?.("[data-file-map]");
   const clickedDependencyPopover = event.target.closest?.("#fileDependencyPopover");
   if (fileMapTrigger) {
@@ -2036,6 +2343,28 @@ function clearNodeSelectionOnOutsideClick(event) {
   state.selectedNodeId = null;
   renderNodeDetails();
   renderGraph();
+}
+
+async function openFileInExplorer(relativePath) {
+  if (!relativePath) {
+    return;
+  }
+  if (!isNativeMaidSpace()) {
+    appendSystemLog("Abrir no Explorer requer MaidSpace local.");
+    return;
+  }
+  try {
+    await fetchJson("/api/open-in-explorer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rootPath: state.result?.rootPath || elements.rootPath.value.trim(),
+        relativePath
+      })
+    });
+  } catch (error) {
+    appendSystemLog(`Explorer: ${errorMessage(error)}`);
+  }
 }
 
 function showFileDependencyPopover(path, event) {
@@ -2079,6 +2408,9 @@ function renderFileDependencyPopover(path, node, dependencyMap) {
       </div>
       <small>${node ? formatBytes(node.size || 0) : "arquivo citado"}</small>
     </header>
+    <div class="file-map-actions">
+      <button class="ghost-button" type="button" data-open-explorer="${escapeHtml(path)}"${isNativeMaidSpace() ? "" : " disabled"}>Abrir no Explorer</button>
+    </div>
     <dl class="file-map-facts">
       <dt>caminho</dt><dd>${fileMapButton(path)}</dd>
       <dt>risco</dt><dd>${node ? riskMarkup(node.risk) : "-"}</dd>
@@ -2158,6 +2490,20 @@ function nodePathFromId(id) {
 
 function normalizePathKey(path) {
   return String(path || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function normalizeRelativePath(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "")
+    .trim()
+    .toLowerCase();
+}
+
+function isPathInsideAny(relativePath, directories) {
+  return (directories || []).some((directory) => relativePath === directory || relativePath.startsWith(`${directory}/`));
 }
 
 function renderNodeDetails() {
@@ -2344,34 +2690,33 @@ function renderRelocationPlan() {
 
   const plan = state.result.relocationPlan;
   if (!plan) {
-    elements.areSummary.innerHTML = empty("Plano A.R.E indisponivel.");
-    elements.areModalBody.innerHTML = empty("Plano A.R.E indisponivel.");
+    elements.areSummary.innerHTML = empty("Painel indisponivel.");
+    elements.areModalBody.innerHTML = empty("Painel indisponivel.");
     if (elements.openAreModal) elements.openAreModal.disabled = true;
     if (elements.openAlcModal) elements.openAlcModal.disabled = true;
-    if (elements.alcModalBody) elements.alcModalBody.innerHTML = empty("Plano A.L.C indisponivel.");
+    if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty("Painel indisponivel.");
     return;
   }
 
   if (elements.openAreModal) elements.openAreModal.disabled = false;
-  if (elements.openAlcModal) elements.openAlcModal.disabled = !getAlcCandidates({ applyRiskFilters: false }).length;
+  if (elements.openAlcModal) elements.openAlcModal.disabled = !hasAnyAlcPlanCandidates(plan);
   elements.areSummary.innerHTML = renderAreSummary(plan);
-  elements.areModalBody.innerHTML = renderAreModal(plan);
-  if (elements.alcModalBody) elements.alcModalBody.innerHTML = renderAlcModal();
+  elements.areModalBody.innerHTML = renderRelocationPanel(plan);
   elements.areSummary.querySelectorAll("[data-open-are-modal]").forEach((button) => {
     button.addEventListener("click", openAreModal);
-  });
-  elements.areModalBody.querySelectorAll("[data-open-alc-modal]").forEach((button) => {
-    button.addEventListener("click", () => {
-      closeAreModal();
-      openAlcModal();
-    });
   });
 }
 
 function renderAreSummary(plan) {
   const modes = ["baixo", "medio", "alto"];
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
   return `
     <div class="are-summary-grid">
+      <button class="are-summary-card are-summary-card-target" type="button" data-open-are-modal>
+        <span>Meta</span>
+        <strong>${escapeHtml(targetPlan?.plannedHuman || targetPlan?.targetHuman || "0 B")}</strong>
+        <small>${escapeHtml(targetPlan?.status || "manual")}</small>
+      </button>
       ${modes.map((modeKey) => {
         const mode = plan.spaceModes?.[modeKey] || {};
         return `
@@ -2383,11 +2728,42 @@ function renderAreSummary(plan) {
         `;
       }).join("")}
       <button class="are-summary-card are-summary-card-blocked" type="button" data-open-are-modal>
-        <span>Bloqueados</span>
+        <span>Isentos</span>
         <strong>${escapeHtml(plan.summary?.blockedHuman || "0 B")}</strong>
         <small>${formatNumber(plan.blockedFiles?.length || 0)} arquivo(s)</small>
       </button>
     </div>
+  `;
+}
+
+function renderRelocationPanel(plan) {
+  return `
+    ${renderAlcModal()}
+    <details class="relocation-details">
+      <summary>Detalhes A.R.E</summary>
+      ${renderAreSimulation(plan)}
+      ${renderAreDepthBreakdown(plan)}
+      <section class="are-modal-summary">
+        ${["baixo", "medio", "alto"].map((modeKey) => {
+          const mode = plan.spaceModes?.[modeKey] || {};
+          const simulation = plan.relocationSimulation?.[modeKey] || {};
+          return `
+            <article class="are-mode-total are-mode-${escapeHtml(modeKey)}">
+              <span>${escapeHtml(modeLabel(modeKey))}</span>
+              <strong>${escapeHtml(mode.reallocatableHuman || "0 B")}</strong>
+              <small>${escapeHtml(mode.inventoryEstimateUsed ? `inventario ${mode.inventoryEstimatedHuman || "0 B"}` : `${formatNumber(mode.packageCount || 0)} pacote(s) / depois: ${simulation.remainingHuman || "0 B"}`)}</small>
+            </article>
+          `;
+        }).join("")}
+        <article class="are-mode-total are-mode-blocked">
+          <span>Isentos</span>
+          <strong>${escapeHtml(plan.summary?.blockedHuman || "0 B")}</strong>
+          <small>${formatNumber(plan.blockedFiles?.length || 0)} arquivo(s)</small>
+        </article>
+      </section>
+      ${["baixo", "medio", "alto"].map((modeKey) => renderAreMode(plan.spaceModes?.[modeKey], modeKey)).join("")}
+      ${renderBlockedFiles(plan.blockedFiles || [])}
+    </details>
   `;
 }
 
@@ -2426,12 +2802,13 @@ function renderAreModal(plan) {
 }
 
 function renderAreAlcBridge(plan) {
-  const candidates = getAlcCandidates({ applyRiskFilters: false });
-  if (!candidates.length) {
+  const candidates = allAlcPlanCandidates(plan);
+  if (!hasAnyAlcPlanCandidates(plan)) {
     return "";
   }
   const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
   const total = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const potentialBytes = Math.max(total, alcPotentialBytes(plan));
   return `
     <section class="are-simulation-board are-alc-bridge">
       <div class="are-section-heading">
@@ -2449,8 +2826,8 @@ function renderAreAlcBridge(plan) {
         </article>
         <article class="are-sim-card">
           <span>Espaco visivel</span>
-          <strong>${formatBytes(total)}</strong>
-          <small>A.L.C confirma antes de mover</small>
+          <strong>${formatBytes(potentialBytes)}</strong>
+          <small>${total > 0 ? "A.L.C confirma antes de mover" : "A.R.E estimou; falta detalhe executavel"}</small>
         </article>
         <article class="are-sim-card">
           <span>Nivel sugerido</span>
@@ -2710,9 +3087,11 @@ function openAreModal() {
   if (!state.result?.relocationPlan || !elements.areModal) {
     return;
   }
+  elements.areModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
   elements.areModal.classList.remove("is-hidden");
   elements.areModal.setAttribute("aria-hidden", "false");
   setModalOpenState();
+  wireAlcModalControls();
 }
 
 function closeAreModal() {
@@ -2725,78 +3104,96 @@ function closeAreModal() {
 }
 
 function openAlcModal() {
-  if (!state.result?.relocationPlan || !elements.alcModal || !elements.alcModalBody) {
-    return;
-  }
-  elements.alcModalBody.innerHTML = renderAlcModal();
-  elements.alcModal.classList.remove("is-hidden");
-  elements.alcModal.setAttribute("aria-hidden", "false");
-  setModalOpenState();
-  wireAlcModalControls();
+  openAreModal();
 }
 
 function closeAlcModal() {
-  if (!elements.alcModal) {
-    return;
-  }
-  elements.alcModal.classList.add("is-hidden");
-  elements.alcModal.setAttribute("aria-hidden", "true");
-  setModalOpenState();
+  closeAreModal();
 }
 
 function setModalOpenState() {
-  const anyOpen = [elements.areModal, elements.alcModal].some((modal) => modal && !modal.classList.contains("is-hidden"));
+  const anyOpen = [elements.areModal].some((modal) => modal && !modal.classList.contains("is-hidden"));
   document.body.classList.toggle("modal-open", anyOpen);
 }
 
 function renderAlcModal() {
-  const candidates = getAlcCandidates();
-  const allCandidates = getAlcCandidates({ applyRiskFilters: false });
+  const filteredCandidates = getAlcCandidates({ limit: Infinity });
+  const previewCandidates = getAlcCandidates({ limit: 260 });
+  const sourceCandidates = getAlcCandidates({
+    applyRiskFilters: false,
+    applyViewFilters: false,
+    applyDecisionFilters: false,
+    applySearchFilters: false,
+    limit: Infinity
+  });
+  const userSourceCandidates = sourceCandidates.filter(isLikelyUserContentCandidate);
   const targetPlan = state.result?.relocationPlan?.targetPlan || state.result?.relocationPlan?.summary?.targetPlan;
   if (!state.result?.relocationPlan) {
     return empty("Execute uma varredura para preparar o A.L.C.");
   }
-  if (!allCandidates.length) {
-    return empty("Nenhum candidato detalhado para o A.L.C executar agora.");
-  }
 
-  const totalBytes = allCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
-  const visibleBytes = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
-  const userContentCount = candidates.filter(isLikelyUserContentCandidate).length;
+  const totalBytes = sourceCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const visibleBytes = filteredCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const userContentCount = filteredCandidates.filter(isLikelyUserContentCandidate).length;
   const nativeExecutor = isNativeMaidSpace();
   const activeMode = currentAlcAreMode();
   const activeRisks = currentAlcRisks();
+  const activeView = currentAlcView();
+  const activeDecision = currentAlcDecision();
+  const search = state.alcFilters.search || "";
+  const planCards = renderAlcPlanCards(state.result.relocationPlan, activeMode);
+  const expansion = state.alcExpandedCandidates?.[alcExpansionKeyForMode(activeMode, state.result.relocationPlan)];
+  const plannedBytes = activeAlcTargetBytes(state.result.relocationPlan);
+  const needsExplorerExpansion = plannedBytes > totalBytes * 1.02;
   const estimateWarning = targetPlan?.status === "estimativa_exige_mais_detalhe"
-    ? `<div class="alc-alert">O A.R.E atingiu a meta por estimativa compactada. O A.L.C MVP executa apenas os candidatos detalhados abaixo; uma etapa futura pode pedir uma segunda varredura focada para completar a meta.</div>`
+    ? `<div class="alc-alert">Meta estimada. O A.L.C detalha a fila antes de executar.</div>`
     : "";
+  const expansionWarning = expansion
+    ? `<div class="alc-alert">Fila A.L.C expandida: ${formatNumber(expansion.files || expansion.candidates?.length || 0)} arquivo(s), ${formatBytes(expansion.bytes || totalBytes)} preparados.</div>`
+    : state.alcExpansionStatus
+      ? `<div class="alc-alert">${escapeHtml(state.alcExpansionStatus)}</div>`
+      : "";
   const nativeWarning = nativeExecutor
     ? ""
-    : `<div class="alc-alert is-strong">O executor A.L.C precisa do MaidSpace local/Tauri. No fallback web, esta tela serve apenas para revisar a fila.</div>`;
+    : `<div class="alc-alert is-strong">Execução real requer MaidSpace local. Aqui é revisão.</div>`;
   const userWarning = userContentCount
-    ? `<div class="alc-alert is-strong">${formatNumber(userContentCount)} candidato(s) parecem conteudo criado pelo usuario. Revise a selecao antes de executar.</div>`
+    ? `<div class="alc-alert is-strong">${formatNumber(userContentCount)} item(ns) parecem do usuário.</div>`
     : "";
 
   return `
     <section class="alc-console">
       ${nativeWarning}
       ${estimateWarning}
+      ${expansionWarning}
       ${userWarning}
       <div class="alc-summary">
-        <span><strong>${formatNumber(candidates.length)}</strong> visivel(is)</span>
-        <span><strong>${formatNumber(allCandidates.length)}</strong> na fonte</span>
-        <span><strong>${formatBytes(visibleBytes)}</strong> filtrados</span>
-        <span><strong>${formatBytes(totalBytes)}</strong> fonte completa</span>
+        <span><strong>${formatBytes(Math.max(plannedBytes, totalBytes))}</strong> plano A.R.E</span>
+        <span><strong>${formatNumber(sourceCandidates.length)}</strong> previa</span>
+        <span><strong>${formatBytes(visibleBytes)}</strong> visível</span>
         <span><strong>${escapeHtml(targetPlan?.targetHuman || "0 B")}</strong> meta</span>
-        <span><strong>${escapeHtml(modeLabel(targetPlan?.selectedMode || "alto"))}</strong> nivel sugerido</span>
+        <span><strong>${escapeHtml(modeLabel(targetPlan?.selectedMode || "alto"))}</strong> nível</span>
+        <span><strong>${formatNumber(userSourceCandidates.length)}</strong> usuário</span>
+        <span><strong>${formatNumber(Object.keys(state.preferences.fileDecisions || {}).length)}</strong> decisões</span>
+      </div>
+      ${planCards}
+      ${renderRelocationTargetControls(state.result.relocationPlan)}
+      ${renderExemptionManager()}
+      <div class="alc-tab-row" role="tablist" aria-label="Visao dos candidatos A.L.C">
+        <button class="mode-button${activeView === "all" ? " is-active" : ""}" type="button" data-alc-view="all">Todos</button>
+        <button class="mode-button${activeView === "user" ? " is-active" : ""}" type="button" data-alc-view="user">Criados pelo usuario</button>
       </div>
       <div class="alc-filter-grid">
         <label class="field">
-          <span>Fonte A.R.E</span>
-          <select id="alcAreMode">
-            <option value="target"${activeMode === "target" ? " selected" : ""}>Plano da meta</option>
-            <option value="baixo"${activeMode === "baixo" ? " selected" : ""}>Nivel baixo</option>
-            <option value="medio"${activeMode === "medio" ? " selected" : ""}>Nivel medio</option>
-            <option value="alto"${activeMode === "alto" ? " selected" : ""}>Nivel alto</option>
+          <span>Buscar arquivo</span>
+          <input id="alcSearch" type="search" spellcheck="false" placeholder="nome, pasta ou extensao" value="${escapeHtml(search)}">
+        </label>
+        <label class="field">
+          <span>Decisao A.R.E</span>
+          <select id="alcDecisionFilter">
+            <option value="all"${activeDecision === "all" ? " selected" : ""}>Todas</option>
+            <option value="pode_apagar"${activeDecision === "pode_apagar" ? " selected" : ""}>Pode apagar</option>
+            <option value="inutil_provavel"${activeDecision === "inutil_provavel" ? " selected" : ""}>Inutil provavel</option>
+            <option value="averiguar"${activeDecision === "averiguar" ? " selected" : ""}>Averiguar</option>
           </select>
         </label>
         <div class="field">
@@ -2814,11 +3211,11 @@ function renderAlcModal() {
       <div class="alc-control-grid" role="radiogroup" aria-label="Destino do A.L.C">
         <label class="alc-target-card">
           <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "trash" ? "" : " checked"}>
-          <span><b>Mover para pasta</b><br>Preserva a estrutura relativa dentro do destino escolhido.</span>
+          <span><b>Mover</b><br>Preserva estrutura relativa no destino.</span>
         </label>
         <label class="alc-target-card">
           <input type="radio" name="alcTargetKind" value="trash"${state.alcDraft.targetKind === "trash" ? " checked" : ""}>
-          <span><b>Enviar para lixeira</b><br>Usa a lixeira do sistema, sem exclusao permanente imediata.</span>
+          <span><b>Lixeira</b><br>Sem exclusão permanente imediata.</span>
         </label>
       </div>
       <div id="alcDestinationBlock" class="alc-destination">
@@ -2829,57 +3226,259 @@ function renderAlcModal() {
             <button id="chooseAlcDestination" class="ghost-button" type="button">Escolher</button>
           </div>
         </label>
-        <p class="muted">Escolha uma pasta fora da raiz varrida para realmente tirar dados do diretorio analisado.</p>
+        <p class="muted">Use uma pasta fora da raiz varrida.</p>
       </div>
       <div class="alc-action-row">
         <div>
           <button id="alcSelectAll" class="ghost-button" type="button">Selecionar tudo</button>
           <button id="alcClearSelection" class="ghost-button" type="button">Limpar selecao</button>
+          <button id="alcExpandExplorer" class="ghost-button" type="button"${needsExplorerExpansion ? "" : " disabled"}>Carregar mini-explorador A.R.E</button>
         </div>
         <span id="alcSelectedSummary" class="muted">Calculando selecao...</span>
       </div>
-      <div class="table-wrap alc-table-wrap">
-        <table class="alc-table">
-          <thead>
-            <tr>
-              <th>Usar</th>
-              <th>Arquivo</th>
-              <th>Espaco</th>
-              <th>Risco</th>
-              <th>Decisao</th>
-              <th>Motivo</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${candidates.length ? candidates.slice(0, 220).map((item) => {
-              const userContent = isLikelyUserContentCandidate(item);
-              return `
-                <tr>
-                  <td><input type="checkbox" data-alc-file="${escapeHtml(item.path)}" checked aria-label="Selecionar ${escapeHtml(item.path)}"></td>
-                  <td class="path-cell">
-                    ${fileMapButton(item.path)}
-                    ${userContent ? `<span class="alc-user-warning">possivel arquivo do usuario</span>` : ""}
-                  </td>
-                  <td>${escapeHtml(item.sizeHuman || item.packageHuman || formatBytes(candidateBytes(item)))}</td>
-                  <td>${riskMarkup(item.risk)}</td>
-                  <td>${escapeHtml(decisionLabel(item.deletionDecision))}</td>
-                  <td>${escapeHtml(item.justification || item.reason || "candidato A.R.E")}</td>
-                </tr>
-              `;
-            }).join("") : `
-              <tr>
-                <td colspan="6">${empty("Nenhum arquivo combina com os filtros atuais.")}</td>
-              </tr>
-            `}
-          </tbody>
-        </table>
-      </div>
+      ${renderAlcMiniExplorer(filteredCandidates, plannedBytes, totalBytes)}
+      ${renderAlcCandidateTable(previewCandidates, sourceCandidates, filteredCandidates)}
       <div id="alcResult" class="alc-result is-hidden"></div>
       <div class="alc-footer">
-        <p class="muted">O A.L.C MVP move arquivos confirmados. A execucao continua sera ligada em etapa posterior.</p>
+        <p class="muted">Nada é movido sem confirmação.</p>
         <button id="executeAlcButton" class="primary-button" type="button"${nativeExecutor ? "" : " disabled"}>Executar A.L.C</button>
       </div>
     </section>
+  `;
+}
+
+function renderRelocationTargetControls(plan) {
+  const highCeiling = plan?.spaceModes?.alto?.reallocatableHuman || "0 B";
+  const value = Number(elements.targetFreeGb?.value || bytesToWholeGb(state.preferences.targetFreeBytes || 0) || 0);
+  return `
+    <section class="relocation-target-board">
+      <label class="field">
+        <span>Meta personalizada (GB)</span>
+        <div class="input-action-row">
+          <input id="relocationTargetGb" type="number" min="0" max="10000" step="1" value="${escapeHtml(value)}">
+          <button id="saveRelocationTarget" class="ghost-button" type="button">Salvar</button>
+        </div>
+      </label>
+      <p class="muted">Teto atual: ${escapeHtml(highCeiling)} no nível alto.</p>
+    </section>
+  `;
+}
+
+function renderExemptionManager() {
+  const directories = state.exemptionDraft.length
+    ? state.exemptionDraft
+    : Object.keys(state.preferences.exemptDirectories || {});
+  return `
+    <section class="exemption-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Pastas isentas</h3>
+          <p class="muted">O A.L.C não move itens dali nem arquivos conectados.</p>
+        </div>
+      </div>
+      <div class="input-action-row">
+        <input id="exemptionPathInput" type="text" spellcheck="false" placeholder="Users/me/Documents/Trabalho">
+        <button id="addExemptionPath" class="ghost-button" type="button">Adicionar</button>
+      </div>
+      <div class="alc-action-row">
+        <button id="chooseExemptionPath" class="ghost-button" type="button">Escolher pasta</button>
+        <button id="saveExemptions" class="ghost-button" type="button">Salvar isenções</button>
+      </div>
+      ${directories.length ? `
+        <ul class="exemption-list">
+          ${directories.map((directory) => `
+            <li>
+              <span>${escapeHtml(directory)}</span>
+              <button class="ghost-button compact-action" type="button" data-remove-exemption="${escapeHtml(directory)}">Remover</button>
+            </li>
+          `).join("")}
+        </ul>
+      ` : `<p class="muted">Nenhuma pasta isenta.</p>`}
+    </section>
+  `;
+}
+
+function renderAlcPlanCards(plan, activeMode) {
+  const targetPlan = plan?.targetPlan || plan?.summary?.targetPlan;
+  const targetSource = getAlcCandidateSourceForMode("target", plan);
+  const targetExpanded = state.alcExpandedCandidates?.[alcExpansionKeyForMode("target", plan)];
+  const cards = [
+    {
+      key: "target",
+      title: "Plano da meta",
+      value: targetPlan?.targetHuman || targetPlan?.plannedHuman || "0 B",
+      sub: `${formatNumber(targetSource.length)} arquivo(s) ${targetExpanded ? "preparados" : "em previa"}`,
+      detail: targetExpanded
+        ? `Fila expandida: ${formatBytes(targetExpanded.bytes || 0)} para meta ${targetExpanded.targetHuman || targetPlan?.targetHuman || "0 B"}.`
+        : targetPlan?.statusText || "Sem meta definida."
+    },
+    ...["baixo", "medio", "alto"].map((mode) => {
+      const modeData = plan?.spaceModes?.[mode] || {};
+      const detailed = getAlcCandidateSourceForMode(mode, plan);
+      const expanded = state.alcExpandedCandidates?.[alcExpansionKeyForMode(mode, plan)];
+      const areFileCount = alcModeFileCount(modeData);
+      return {
+        key: mode,
+        title: modeLabel(mode),
+        value: modeData.reallocatableHuman || "0 B",
+        sub: `${formatNumber(detailed.length)} ${expanded ? "preparado(s)" : "em previa"} / ${formatNumber(areFileCount)} no A.R.E`,
+        detail: expanded
+          ? `Fila expandida: ${formatBytes(expanded.bytes || 0)} de ${modeData.reallocatableHuman || "0 B"}.`
+          : modeData.inventoryEstimateUsed
+          ? `A.R.E estima ${modeData.inventoryEstimatedHuman || "0 B"}; detalhado ${modeData.detailedReallocatableHuman || "0 B"}.`
+          : modeData.description || "Plano A.R.E."
+      };
+    })
+  ];
+
+  return `
+    <section class="alc-plan-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Planos A.R.E para executar no A.L.C</h3>
+          <p class="muted">Escolha uma fonte. Os numeros baixo, medio e alto sao os mesmos totais calculados pelo A.R.E.</p>
+        </div>
+      </div>
+      <div class="alc-plan-grid">
+        ${cards.map((card) => `
+          <button class="alc-plan-card${activeMode === card.key ? " is-active" : ""}" type="button" data-alc-plan="${escapeHtml(card.key)}">
+            <span>${escapeHtml(card.title)}</span>
+            <strong>${escapeHtml(card.value)}</strong>
+            <small>${escapeHtml(card.sub)}</small>
+            <em>${escapeHtml(card.detail)}</em>
+          </button>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function alcModeFileCount(modeData = {}) {
+  return Math.max(
+    Number(modeData.executableFileCount || 0),
+    Number(modeData.inventoryEstimatedFiles || 0),
+    Number(modeData.detailedFileCount || 0),
+    Number(modeData.fileCount || 0)
+  );
+}
+
+function renderAlcMiniExplorer(candidates, plannedBytes, previewBytes) {
+  if (!candidates.length) {
+    return "";
+  }
+  const groups = new Map();
+  for (const item of candidates) {
+    const key = alcExplorerGroup(item.path);
+    if (!groups.has(key)) {
+      groups.set(key, { path: key, files: 0, bytes: 0, risks: new Set() });
+    }
+    const group = groups.get(key);
+    group.files += 1;
+    group.bytes += candidateBytes(item);
+    group.risks.add(item.risk || "baixo");
+  }
+  const topGroups = Array.from(groups.values())
+    .sort((a, b) => b.bytes - a.bytes || b.files - a.files || a.path.localeCompare(b.path))
+    .slice(0, 18);
+  const coverage = plannedBytes > previewBytes * 1.02
+    ? `<p class="muted">Previa carregada: ${formatBytes(previewBytes)} de ${formatBytes(plannedBytes)}. A execucao local completa o plano.</p>`
+    : "";
+
+  return `
+    <section class="alc-mini-explorer">
+      <div class="are-section-heading">
+        <div>
+          <h3>Mini-explorador A.L.C</h3>
+          ${coverage}
+        </div>
+      </div>
+      <div class="alc-folder-grid">
+        ${topGroups.map((group) => `
+          <button class="alc-folder-card" type="button" data-alc-folder-filter="${escapeHtml(group.path === "." ? "" : group.path)}">
+            <span>${escapeHtml(group.path === "." ? "raiz" : group.path)}</span>
+            <strong>${escapeHtml(formatBytes(group.bytes))}</strong>
+            <small>${formatNumber(group.files)} arquivo(s) · ${escapeHtml(maxRiskLabel(Array.from(group.risks)))}</small>
+          </button>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function alcExplorerGroup(relativePath) {
+  const normalized = String(relativePath || ".").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!normalized.length) {
+    return ".";
+  }
+  return normalized.slice(0, Math.min(2, normalized.length)).join("/");
+}
+
+function maxRiskLabel(risks) {
+  if (risks.includes("critico")) return "critico";
+  if (risks.includes("alto")) return "alto";
+  if (risks.includes("medio")) return "medio";
+  return "baixo";
+}
+
+function renderAlcCandidateTable(candidates, sourceCandidates, filteredCandidates = candidates) {
+  const hasSource = sourceCandidates.length > 0;
+  const hiddenCount = Math.max(0, filteredCandidates.length - candidates.length);
+  const emptyMessage = hasSource
+    ? "Nenhum arquivo combina com os filtros atuais. Ajuste riscos, decisao, busca ou a aba de visao."
+    : "Esta fonte do A.R.E nao tem candidatos detalhados carregados para o A.L.C. Os totais ainda aparecem nos planos acima quando o A.R.E usou estimativa.";
+
+  return `
+    <div class="table-wrap alc-table-wrap">
+      ${hiddenCount ? `<div class="alc-table-note">Mostrando ${formatNumber(candidates.length)} de ${formatNumber(filteredCandidates.length)} candidato(s). A execução usa o plano filtrado inteiro.</div>` : ""}
+      <table class="alc-table">
+        <thead>
+          <tr>
+            <th>Usar</th>
+            <th>Arquivo</th>
+            <th>Espaco</th>
+            <th>Risco</th>
+            <th>Decisao</th>
+            <th>Motivo</th>
+            <th>Agência</th>
+            <th>Abrir</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${candidates.length ? candidates.slice(0, 260).map((item) => {
+            const userContent = isLikelyUserContentCandidate(item);
+            const preference = preferenceDecisionForCandidate(item);
+            const needsApproval = candidateNeedsUserApproval(item);
+            const checked = candidateIsSelected(item);
+            const disabled = needsApproval && preference !== "relocate";
+            return `
+              <tr>
+                <td><input type="checkbox" data-alc-file="${escapeHtml(item.path)}"${checked ? " checked" : ""}${disabled ? " disabled" : ""} aria-label="Selecionar ${escapeHtml(item.path)}"></td>
+                <td class="path-cell">
+                  ${fileMapButton(item.path)}
+                  ${userContent ? `<span class="alc-user-warning">classificado como criado pelo usuario</span>` : ""}
+                  ${needsApproval && preference !== "relocate" ? `<span class="alc-user-warning">precisa de avaliacao</span>` : ""}
+                </td>
+                <td>${escapeHtml(item.sizeHuman || item.packageHuman || formatBytes(candidateBytes(item)))}</td>
+                <td>${riskMarkup(item.risk)}</td>
+                <td>${escapeHtml(decisionLabel(item.deletionDecision))}</td>
+                <td>${escapeHtml(item.justification || item.reason || "candidato A.R.E")}</td>
+                <td>
+                  <div class="file-agency-actions">
+                    <button class="ghost-button compact-action" type="button" data-file-decision="relocate" data-file-path="${escapeHtml(item.path)}">${preference === "relocate" ? "Aprovado" : "Relocar"}</button>
+                    <button class="ghost-button compact-action" type="button" data-file-decision="ignore" data-file-path="${escapeHtml(item.path)}">Ignorar</button>
+                  </div>
+                </td>
+                <td><button class="ghost-button compact-action" type="button" data-open-explorer="${escapeHtml(item.path)}"${isNativeMaidSpace() ? "" : " disabled"}>Explorer</button></td>
+              </tr>
+            `;
+          }).join("") : `
+            <tr>
+              <td colspan="8">${empty(emptyMessage)}</td>
+            </tr>
+          `}
+        </tbody>
+      </table>
+    </div>
   `;
 }
 
@@ -2890,7 +3489,8 @@ function wireAlcModalControls() {
   }
 
   const destinationInput = body.querySelector("#alcDestinationPath");
-  const executeButton = body.querySelector("#executeAlcButton");
+  const executeBody = elements.alcModalBody || body;
+  const executeButton = executeBody.querySelector("#executeAlcButton");
   const destinationBlock = body.querySelector("#alcDestinationBlock");
   const summary = body.querySelector("#alcSelectedSummary");
   const update = () => {
@@ -2899,21 +3499,47 @@ function wireAlcModalControls() {
     state.alcDraft.targetDirectory = destinationInput?.value.trim() || "";
     const selected = selectedAlcCandidates();
     const bytes = selected.reduce((sum, item) => sum + candidateBytes(item), 0);
+    const plannedBytes = activeAlcTargetBytes();
+    const canExecutePlan = alcExecutionFiltersAreBroad() && plannedBytes > 0;
     const hasDestination = kind === "trash" || Boolean(destinationInput?.value.trim());
     if (destinationBlock) {
       destinationBlock.style.display = kind === "directory" ? "grid" : "none";
     }
     if (summary) {
-      summary.textContent = `${formatNumber(selected.length)} arquivo(s), ${formatBytes(bytes)} selecionados`;
+      summary.textContent = canExecutePlan && bytes < plannedBytes * 0.98
+        ? `${formatNumber(selected.length)} em previa, plano ${formatBytes(plannedBytes)}`
+        : `${formatNumber(selected.length)} arquivo(s), ${formatBytes(bytes)} selecionados`;
     }
     if (executeButton) {
-      executeButton.disabled = !isNativeMaidSpace() || !selected.length || !hasDestination;
+      executeButton.disabled = !isNativeMaidSpace() || (!selected.length && !canExecutePlan) || !hasDestination;
     }
   };
 
-  body.querySelector("#alcAreMode")?.addEventListener("change", (event) => {
-    state.alcFilters.areMode = event.target.value;
+  body.querySelectorAll("[data-alc-plan]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.alcFilters.areMode = button.dataset.alcPlan || "target";
+      refreshAlcModal();
+    });
+  });
+  body.querySelectorAll("[data-alc-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.alcFilters.view = button.dataset.alcView || "all";
+      refreshAlcModal();
+    });
+  });
+  body.querySelector("#alcDecisionFilter")?.addEventListener("change", (event) => {
+    state.alcFilters.decision = event.target.value || "all";
     refreshAlcModal();
+  });
+  body.querySelector("#alcSearch")?.addEventListener("change", (event) => {
+    state.alcFilters.search = event.target.value || "";
+    refreshAlcModal();
+  });
+  body.querySelector("#alcSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      state.alcFilters.search = event.target.value || "";
+      refreshAlcModal();
+    }
   });
   body.querySelectorAll("[data-alc-risk-filter]").forEach((input) => {
     input.addEventListener("change", () => {
@@ -2922,13 +3548,70 @@ function wireAlcModalControls() {
       refreshAlcModal();
     });
   });
+  body.querySelectorAll("[data-alc-folder-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.alcFilters.search = button.dataset.alcFolderFilter || "";
+      refreshAlcModal();
+    });
+  });
   body.querySelectorAll("input[name='alcTargetKind']").forEach((input) => {
     input.addEventListener("change", update);
   });
   body.querySelectorAll("[data-alc-file]").forEach((input) => {
-    input.addEventListener("change", update);
+    input.addEventListener("change", () => {
+      setCandidateSelectionOverride(input.dataset.alcFile, input.checked);
+      update();
+    });
   });
   destinationInput?.addEventListener("input", update);
+  body.querySelector("#saveRelocationTarget")?.addEventListener("click", async () => {
+    const input = body.querySelector("#relocationTargetGb");
+    const bytes = Math.max(0, Number(input?.value || 0)) * 1024 * 1024 * 1024;
+    if (elements.targetFreeGb) {
+      elements.targetFreeGb.value = bytesToWholeGb(bytes);
+    }
+    await saveTargetPreference(bytes);
+    state.alcExpandedCandidates = {};
+    state.alcExpansionStatus = null;
+    appendSystemLog(`Meta salva: ${formatBytes(bytes)}. Nova varredura recalcula o plano.`);
+    refreshAlcModal();
+  });
+  body.querySelector("#addExemptionPath")?.addEventListener("click", () => {
+    const input = body.querySelector("#exemptionPathInput");
+    const value = normalizeExemptionInput(input?.value || "");
+    if (!value) {
+      return;
+    }
+    state.exemptionDraft = Array.from(new Set([...(state.exemptionDraft || []), value]));
+    refreshAlcModal();
+  });
+  body.querySelector("#chooseExemptionPath")?.addEventListener("click", async () => {
+    const rootPath = state.result?.rootPath || elements.rootPath.value.trim();
+    const directory = await pickDirectory("Cole a pasta a isentar:");
+    if (!directory) {
+      return;
+    }
+    const relative = directoryToRelative(rootPath, directory);
+    state.exemptionDraft = Array.from(new Set([...(state.exemptionDraft || []), relative]));
+    refreshAlcModal();
+  });
+  body.querySelector("#saveExemptions")?.addEventListener("click", async () => {
+    await saveExemptionPreferences(state.exemptionDraft);
+  });
+  body.querySelectorAll("[data-remove-exemption]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const remove = normalizeRelativePath(button.dataset.removeExemption);
+      state.exemptionDraft = (state.exemptionDraft || []).filter((item) => normalizeRelativePath(item) !== remove);
+      refreshAlcModal();
+    });
+  });
+  body.querySelectorAll("[data-file-decision]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await saveFilePreference(button.dataset.filePath, button.dataset.fileDecision, {
+        size: candidateBytes(getAlcCandidateSource().find((item) => item.path === button.dataset.filePath) || {})
+      });
+    });
+  });
   body.querySelector("#chooseAlcDestination")?.addEventListener("click", async () => {
     try {
       const directory = await pickDirectory("Cole o caminho de destino do A.L.C:");
@@ -2941,16 +3624,28 @@ function wireAlcModalControls() {
     }
   });
   body.querySelector("#alcSelectAll")?.addEventListener("click", () => {
+    state.alcSelection.mode = "all";
+    state.alcSelection.overrides = {};
     body.querySelectorAll("[data-alc-file]").forEach((input) => {
-      input.checked = true;
+      input.checked = !input.disabled;
     });
     update();
   });
   body.querySelector("#alcClearSelection")?.addEventListener("click", () => {
+    state.alcSelection.mode = "none";
+    state.alcSelection.overrides = {};
     body.querySelectorAll("[data-alc-file]").forEach((input) => {
       input.checked = false;
     });
     update();
+  });
+  body.querySelector("#alcExpandExplorer")?.addEventListener("click", async () => {
+    try {
+      await expandAlcCandidatesIfNeeded();
+    } catch (error) {
+      appendSystemLog(`Mini-explorador A.L.C: ${errorMessage(error)}`);
+      showAlcResult(null, error);
+    }
   });
   executeButton?.addEventListener("click", executeAlcRelocation);
   update();
@@ -2960,7 +3655,7 @@ function refreshAlcModal() {
   if (!elements.alcModalBody || elements.alcModal?.classList.contains("is-hidden")) {
     return;
   }
-  elements.alcModalBody.innerHTML = renderAlcModal();
+  elements.alcModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
   wireAlcModalControls();
 }
 
@@ -2969,35 +3664,155 @@ function currentAlcAreMode() {
   return ["target", "baixo", "medio", "alto"].includes(mode) ? mode : "target";
 }
 
+function currentAlcView() {
+  const view = state.alcFilters?.view || "all";
+  return ["all", "user"].includes(view) ? view : "all";
+}
+
+function currentAlcDecision() {
+  const decision = state.alcFilters?.decision || "all";
+  return ["all", "pode_apagar", "inutil_provavel", "averiguar"].includes(decision) ? decision : "all";
+}
+
 function currentAlcRisks() {
   const risks = Array.isArray(state.alcFilters?.risks) ? state.alcFilters.risks : [];
   return risks.filter((risk) => ["baixo", "medio", "alto", "critico"].includes(risk));
 }
 
-function getAlcCandidateSource() {
-  const plan = state.result?.relocationPlan;
+function alcExecutionFiltersAreBroad() {
+  const risks = currentAlcRisks();
+  return currentAlcView() === "all"
+    && currentAlcDecision() === "all"
+    && !String(state.alcFilters?.search || "").trim()
+    && ["baixo", "medio", "alto", "critico"].every((risk) => risks.includes(risk));
+}
+
+function hasAnyAlcPlanCandidates(plan = state.result?.relocationPlan) {
+  return allAlcPlanCandidates(plan).length > 0 || alcPotentialBytes(plan) > 0;
+}
+
+function alcPotentialBytes(plan = state.result?.relocationPlan) {
+  if (!plan) {
+    return 0;
+  }
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
+  const targetBytes = Number(targetPlan?.plannedBytes || targetPlan?.targetBytes || 0);
+  const modeBytes = ["baixo", "medio", "alto"].map((mode) => Number(plan.spaceModes?.[mode]?.reallocatableBytes || 0));
+  return Math.max(targetBytes, ...modeBytes, 0);
+}
+
+function allAlcPlanCandidates(plan = state.result?.relocationPlan) {
+  if (!plan) {
+    return [];
+  }
+  const seen = new Set();
+  return ["target", "baixo", "medio", "alto"]
+    .flatMap((mode) => getAlcCandidateSourceForMode(mode, plan))
+    .filter((item) => {
+      if (
+        !item?.path
+        || item.deletionDecision === "nao_apagar"
+        || preferenceDecisionForCandidate(item) === "ignore"
+        || isCandidateBlockedByExemption(item)
+        || seen.has(item.path)
+      ) {
+        return false;
+      }
+      seen.add(item.path);
+      return true;
+    });
+}
+
+function getAlcCandidateSourceForMode(mode, plan = state.result?.relocationPlan) {
   if (!plan) {
     return [];
   }
 
+  const expanded = expandedAlcCandidatesForMode(mode, plan);
+  if (expanded) {
+    return expanded;
+  }
+
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
+  if (mode === "target") {
+    if (targetPlan?.candidates?.length) {
+      return targetPlan.candidates;
+    }
+    const selected = targetPlan?.selectedMode;
+    if (["baixo", "medio", "alto"].includes(selected)) {
+      return plan.spaceModes?.[selected]?.candidates || [];
+    }
+    return plan.spaceModes?.alto?.candidates || [];
+  }
+  return plan.spaceModes?.[mode]?.candidates || [];
+}
+
+function expandedAlcCandidatesForMode(mode, plan = state.result?.relocationPlan) {
+  const key = alcExpansionKeyForMode(mode, plan);
+  if (!key) {
+    return null;
+  }
+  return state.alcExpandedCandidates?.[key]?.candidates || null;
+}
+
+function alcExpansionKeyForMode(mode, plan = state.result?.relocationPlan) {
+  if (!plan) {
+    return "";
+  }
+  const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
+  if (mode === "target") {
+    const selected = ["baixo", "medio", "alto"].includes(targetPlan?.selectedMode)
+      ? targetPlan.selectedMode
+      : "alto";
+    const targetBytes = Number(targetPlan?.targetBytes || targetPlan?.plannedBytes || 0);
+    return `target:${selected}:${targetBytes}`;
+  }
+  return ["baixo", "medio", "alto"].includes(mode) ? `mode:${mode}` : "";
+}
+
+function activeAlcExecutionMode(plan = state.result?.relocationPlan) {
+  const mode = currentAlcAreMode();
+  if (mode !== "target") {
+    return mode;
+  }
+  const targetPlan = plan?.targetPlan || plan?.summary?.targetPlan;
+  return ["baixo", "medio", "alto"].includes(targetPlan?.selectedMode) ? targetPlan.selectedMode : "alto";
+}
+
+function activeAlcTargetBytes(plan = state.result?.relocationPlan) {
+  if (!plan) {
+    return 0;
+  }
   const mode = currentAlcAreMode();
   const targetPlan = plan.targetPlan || plan.summary?.targetPlan;
   if (mode === "target") {
-    return targetPlan?.candidates?.length
-      ? targetPlan.candidates
-      : plan.spaceModes?.alto?.candidates || [];
+    return Number(targetPlan?.targetBytes || targetPlan?.plannedBytes || 0);
   }
-  return plan.spaceModes?.[mode]?.candidates || [];
+  return Number(plan.spaceModes?.[mode]?.reallocatableBytes || 0);
+}
+
+function getAlcCandidateSource() {
+  return getAlcCandidateSourceForMode(currentAlcAreMode());
 }
 
 function getAlcCandidates(options = {}) {
   const source = getAlcCandidateSource();
   const activeRisks = currentAlcRisks();
   const applyRiskFilters = options.applyRiskFilters !== false;
+  const applyViewFilters = options.applyViewFilters !== false;
+  const activeView = currentAlcView();
+  const activeDecision = currentAlcDecision();
+  const search = String(state.alcFilters?.search || "").trim().toLowerCase();
+  const limit = Number.isFinite(options.limit) ? options.limit : Infinity;
   const seen = new Set();
-  return source
+  const items = source
     .filter((item) => item && item.path && item.deletionDecision !== "nao_apagar")
+    .filter((item) => preferenceDecisionForCandidate(item) !== "ignore")
+    .filter((item) => !isCandidateBlockedByExemption(item))
     .filter((item) => !applyRiskFilters || activeRisks.includes(item.risk || "baixo"))
+    .filter((item) => !applyViewFilters || activeView !== "user" || isLikelyUserContentCandidate(item))
+    .filter((item) => options.applyDecisionFilters === false || activeDecision === "all" || item.deletionDecision === activeDecision)
+    .filter((item) => options.applySearchFilters === false || !search || String(item.path || "").toLowerCase().includes(search))
     .sort((a, b) => candidateBytes(b) - candidateBytes(a))
     .filter((item) => {
       if (seen.has(item.path)) {
@@ -3005,19 +3820,139 @@ function getAlcCandidates(options = {}) {
       }
       seen.add(item.path);
       return true;
+    });
+  return Number.isFinite(limit) ? items.slice(0, limit) : items;
+}
+
+function preferenceDecisionForCandidate(item) {
+  const key = normalizeRelativePath(item?.path);
+  return state.preferences.fileDecisions?.[key]?.decision || null;
+}
+
+function candidateNeedsUserApproval(item) {
+  return item?.risk === "alto" || item?.risk === "critico";
+}
+
+function shouldCandidateBePreselected(item) {
+  if (preferenceDecisionForCandidate(item) === "relocate") {
+    return true;
+  }
+  if (candidateNeedsUserApproval(item)) {
+    return false;
+  }
+  const activeMode = currentAlcAreMode();
+  const executionMode = activeAlcExecutionMode();
+  if ((activeMode === "target" || executionMode === "alto") && item?.deletionDecision !== "nao_apagar") {
+    return true;
+  }
+  return item?.deletionDecision === "pode_apagar" || item?.deletionDecision === "inutil_provavel";
+}
+
+function candidateIsSelected(item) {
+  const key = normalizeRelativePath(item?.path);
+  const override = state.alcSelection?.overrides?.[key];
+  if (typeof override === "boolean") {
+    return override;
+  }
+  if (candidateNeedsUserApproval(item) && preferenceDecisionForCandidate(item) !== "relocate") {
+    return false;
+  }
+  if (state.alcSelection?.mode === "all") {
+    return true;
+  }
+  if (state.alcSelection?.mode === "none") {
+    return false;
+  }
+  return shouldCandidateBePreselected(item);
+}
+
+function setCandidateSelectionOverride(relativePath, selected) {
+  const key = normalizeRelativePath(relativePath);
+  if (!key) {
+    return;
+  }
+  state.alcSelection.overrides[key] = Boolean(selected);
+}
+
+function isCandidateBlockedByExemption(item) {
+  const relative = normalizeRelativePath(item?.path);
+  const directories = Object.keys(state.preferences.exemptDirectories || {});
+  return isPathInsideAny(relative, directories);
+}
+
+function exemptionDraftChanged() {
+  const draft = (state.exemptionDraft || []).map(normalizeRelativePath).sort();
+  const saved = Object.keys(state.preferences.exemptDirectories || {}).map(normalizeRelativePath).sort();
+  return JSON.stringify(draft) !== JSON.stringify(saved);
+}
+
+function normalizeExemptionInput(value) {
+  const rootPath = state.result?.rootPath || elements.rootPath.value.trim();
+  return directoryToRelative(rootPath, value);
+}
+
+function directoryToRelative(rootPath, directory) {
+  const normalizedRoot = normalizeRelativePath(String(rootPath || "").replace(/^[a-zA-Z]:/, ""));
+  const normalizedDirectory = normalizeRelativePath(String(directory || "").replace(/^[a-zA-Z]:/, ""));
+  if (normalizedRoot && normalizedDirectory.startsWith(`${normalizedRoot}/`)) {
+    return normalizedDirectory.slice(normalizedRoot.length + 1);
+  }
+  return normalizedDirectory;
+}
+
+async function expandAlcCandidatesIfNeeded() {
+  const plan = state.result?.relocationPlan;
+  if (!plan) {
+    return false;
+  }
+  const currentMode = currentAlcAreMode();
+  const executionMode = activeAlcExecutionMode(plan);
+  const targetBytes = activeAlcTargetBytes(plan);
+  const key = alcExpansionKeyForMode(currentMode, plan);
+  if (!key || !targetBytes || state.alcExpandedCandidates?.[key]) {
+    return false;
+  }
+
+  const source = getAlcCandidateSourceForMode(currentMode, plan);
+  const sourceBytes = source.reduce((sum, item) => sum + candidateBytes(item), 0);
+  if (sourceBytes >= targetBytes * 0.98) {
+    return false;
+  }
+
+  state.alcExpansionStatus = `Detalhando fila ${modeLabel(executionMode)} ate ${formatBytes(targetBytes)}...`;
+  appendSystemLog(`A.L.C expandindo candidatos: ${formatBytes(sourceBytes)} detalhados de ${formatBytes(targetBytes)} previstos.`);
+  refreshAlcModal();
+
+  const result = await fetchJson("/api/alc/expand-candidates", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rootPath: state.result.rootPath || elements.rootPath.value.trim(),
+      mode: executionMode,
+      targetBytes,
+      limit: 1000000
     })
-    .slice(0, 220);
+  });
+
+  const candidates = Array.isArray(result.candidates) ? result.candidates : [];
+  if (!candidates.length) {
+    state.alcExpansionStatus = "A.L.C nao encontrou candidatos reais suficientes para esta meta.";
+    refreshAlcModal();
+    throw new Error("O A.L.C nao encontrou arquivos executaveis para cumprir este plano. Rode nova varredura ou revise filtros/isencoes.");
+  }
+
+  state.alcExpandedCandidates[key] = {
+    ...result,
+    candidates
+  };
+  state.alcExpansionStatus = `Fila expandida: ${formatNumber(candidates.length)} arquivo(s), ${formatBytes(result.bytes || 0)}.`;
+  appendSystemLog(`A.L.C preparou ${formatNumber(candidates.length)} candidato(s), somando ${formatBytes(result.bytes || 0)}.`);
+  refreshAlcModal();
+  return true;
 }
 
 function selectedAlcCandidates() {
-  const body = elements.alcModalBody;
-  if (!body) {
-    return [];
-  }
-  const selectedPaths = new Set(
-    Array.from(body.querySelectorAll("[data-alc-file]:checked")).map((input) => input.dataset.alcFile)
-  );
-  return getAlcCandidates().filter((item) => selectedPaths.has(item.path));
+  return getAlcCandidates({ limit: Infinity }).filter(candidateIsSelected);
 }
 
 async function executeAlcRelocation() {
@@ -3030,17 +3965,39 @@ async function executeAlcRelocation() {
   const targetDirectory = targetKind === "directory"
     ? body.querySelector("#alcDestinationPath")?.value.trim()
     : null;
-  const candidates = selectedAlcCandidates();
-  const userContentCount = candidates.filter(isLikelyUserContentCandidate).length;
-  const selectedBytes = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
 
-  if (!candidates.length) {
+  if (targetKind === "directory" && !targetDirectory) {
+    showAlcResult(null, new Error("Escolha a pasta de destino."));
+    return;
+  }
+
+  if (exemptionDraftChanged()) {
+    await saveExemptionPreferences(state.exemptionDraft);
+  }
+
+  try {
+    await expandAlcCandidatesIfNeeded();
+  } catch (error) {
+    appendSystemLog(`Mini-explorador A.L.C parcial: ${errorMessage(error)}. A execucao local ainda usara o plano A.R.E.`);
+  }
+
+  const candidates = selectedAlcCandidates();
+  const plan = state.result?.relocationPlan;
+  const planMode = activeAlcExecutionMode(plan);
+  const planTargetBytes = activeAlcTargetBytes(plan);
+  const userContentCount = candidates.filter(isLikelyUserContentCandidate).length;
+  const unapprovedHighRisk = candidates.filter((item) => candidateNeedsUserApproval(item) && preferenceDecisionForCandidate(item) !== "relocate");
+  const selectedBytes = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const executeByPlan = alcExecutionFiltersAreBroad() && Boolean(planTargetBytes && selectedBytes < planTargetBytes * 0.98);
+  const confirmationBytes = executeByPlan ? planTargetBytes : selectedBytes;
+
+  if (!candidates.length && !executeByPlan) {
     showAlcResult(null, new Error("Selecione pelo menos um arquivo."));
     return;
   }
 
-  if (targetKind === "directory" && !targetDirectory) {
-    showAlcResult(null, new Error("Escolha a pasta de destino."));
+  if (unapprovedHighRisk.length && !executeByPlan) {
+    showAlcResult(null, new Error("Arquivos de risco alto precisam ser avaliados com Relocar antes da execucao."));
     return;
   }
 
@@ -3048,7 +4005,11 @@ async function executeAlcRelocation() {
   const warning = userContentCount
     ? `\n\nATENCAO: ${userContentCount} arquivo(s) parecem conteudo criado pelo usuario.`
     : "";
-  const confirmed = window.confirm(`Confirmar A.L.C para ${actionLabel} ${candidates.length} arquivo(s), somando ${formatBytes(selectedBytes)}?${warning}`);
+  const exemptions = Object.keys(state.preferences.exemptDirectories || {}).length;
+  const planWarning = executeByPlan
+    ? `\n\nO A.L.C vai expandir o plano ${modeLabel(planMode)} no nativo ate aproximadamente ${formatBytes(planTargetBytes)}. A lista visivel e apenas a previa.`
+    : "";
+  const confirmed = window.confirm(`Confirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
   if (!confirmed) {
     return;
   }
@@ -3065,6 +4026,9 @@ async function executeAlcRelocation() {
       rootPath: state.result.rootPath || elements.rootPath.value.trim(),
       targetKind,
       targetDirectory,
+      planMode,
+      targetBytes: executeByPlan ? planTargetBytes : selectedBytes,
+      expandPlan: executeByPlan,
       files: candidates.map((item) => ({
         relativePath: item.path,
         size: candidateBytes(item),

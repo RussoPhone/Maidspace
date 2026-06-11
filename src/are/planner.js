@@ -423,6 +423,9 @@ function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
     const inventoryEstimatedBytes = options.inventoryEstimate?.[mode]?.bytes || 0;
     const inventoryEstimatedFiles = options.inventoryEstimate?.[mode]?.files || 0;
     const reallocatableBytes = Math.max(detailedReallocatableBytes, inventoryEstimatedBytes);
+    const detailedFileCount = entries.length;
+    const previewCandidateCount = candidates.length;
+    const executableFileCount = Math.max(detailedFileCount, inventoryEstimatedFiles, previewCandidateCount);
 
     result[mode] = {
       mode,
@@ -437,6 +440,9 @@ function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
       inventoryEstimatedHuman: formatBytes(inventoryEstimatedBytes),
       inventoryEstimatedFiles,
       inventoryEstimateUsed: inventoryEstimatedBytes > detailedReallocatableBytes,
+      detailedFileCount,
+      previewCandidateCount,
+      executableFileCount,
       fileCount: candidates.length,
       packageCount: packages.length,
       packageFileCount: packages.reduce((sum, item) => sum + item.fileCount, 0),
@@ -482,28 +488,24 @@ function buildTargetCleanupPlan(spaceModes, targetFreeBytes) {
       continue;
     }
 
-    let total = 0;
-    const selected = [];
-    for (const item of modeData.candidates || []) {
-      if (total >= targetFreeBytes) {
-        break;
-      }
-      selected.push(item);
-      total += item.packageBytes || item.sizeBytes || 0;
-    }
+    const selected = selectApproximateCandidates(modeData.candidates || [], targetFreeBytes);
+    const total = selected.reduce((sum, item) => sum + (item.packageBytes || item.sizeBytes || 0), 0);
 
     const enoughFromDetailedList = total >= targetFreeBytes;
+    const hasApproximation = total > 0;
     return {
       targetBytes: targetFreeBytes,
       targetHuman: formatBytes(targetFreeBytes),
       selectedMode: mode,
-      plannedBytes: enoughFromDetailedList ? total : modeData.reallocatableBytes,
-      plannedHuman: formatBytes(enoughFromDetailedList ? total : modeData.reallocatableBytes),
+      plannedBytes: hasApproximation ? total : modeData.reallocatableBytes,
+      plannedHuman: formatBytes(hasApproximation ? total : modeData.reallocatableBytes),
       selectedFiles: selected.length,
       candidates: selected,
-      status: enoughFromDetailedList ? "atingivel" : "estimativa_exige_mais_detalhe",
+      status: enoughFromDetailedList ? "atingivel" : hasApproximation ? "aproximado" : "estimativa_exige_mais_detalhe",
       statusText: enoughFromDetailedList
         ? `usar modo ${mode} libera aproximadamente ${formatBytes(total)} com ${selected.length} arquivo(s).`
+        : hasApproximation
+          ? `modo ${mode} chega perto da meta: ${formatBytes(total)} com ${selected.length} arquivo(s).`
         : `modo ${mode} parece suficiente pela estimativa total (${modeData.reallocatableHuman}), mas a lista detalhada foi compactada.`
     };
   }
@@ -520,6 +522,48 @@ function buildTargetCleanupPlan(spaceModes, targetFreeBytes) {
     status: "insuficiente",
     statusText: `o inventario encontrou ${highest.reallocatableHuman || "0 B"}, abaixo da meta ${formatBytes(targetFreeBytes)}.`
   };
+}
+
+function selectApproximateCandidates(candidates, targetBytes) {
+  const ordered = (candidates || [])
+    .slice()
+    .sort((a, b) => (b.packageBytes || b.sizeBytes || 0) - (a.packageBytes || a.sizeBytes || 0));
+  const selected = [];
+  const skipped = [];
+  let total = 0;
+
+  for (const item of ordered) {
+    const bytes = item.packageBytes || item.sizeBytes || 0;
+    if (!bytes || total >= targetBytes) {
+      continue;
+    }
+    const underBy = targetBytes - total;
+    if (bytes <= underBy) {
+      selected.push(item);
+      total += bytes;
+    } else {
+      skipped.push(item);
+    }
+  }
+
+  if (total >= targetBytes || !skipped.length) {
+    return selected;
+  }
+
+  let best = null;
+  let bestDelta = Math.abs(targetBytes - total);
+  for (const item of skipped) {
+    const bytes = item.packageBytes || item.sizeBytes || 0;
+    const delta = Math.abs(targetBytes - (total + bytes));
+    if (delta < bestDelta) {
+      best = item;
+      bestDelta = delta;
+    }
+  }
+  if (best) {
+    selected.push(best);
+  }
+  return selected;
 }
 
 function buildModePackages(entries, nodeByPath, mode, options = {}) {
