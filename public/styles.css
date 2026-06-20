@@ -970,10 +970,45 @@ summary {
   border-left-color: var(--high);
 }
 
+.alc-safety-notice {
+  background: #fff8e8;
+  border: 1px solid #ead39a;
+  border-left: 4px solid var(--medium);
+  color: #3d3321;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.alc-safety-notice strong {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 3px;
+}
+
+.alc-safety-notice p,
+.alc-safety-notice li,
+.alc-safety-notice small {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.alc-safety-notice ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.alc-safety-notice small {
+  color: #6d5422;
+  font-weight: 800;
+}
+
 .alc-control-grid {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .alc-filter-grid {
@@ -1031,6 +1066,13 @@ summary {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.alc-target-card small {
+  display: block;
+  font-size: 11px;
+  line-height: 1.35;
+  margin-top: 2px;
 }
 
 .alc-destination {

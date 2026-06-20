@@ -3258,13 +3258,14 @@ function renderAlcModal() {
       : "";
   const nativeWarning = nativeExecutor
     ? ""
-    : `<div class="alc-alert is-strong">Local</div>`;
+    : `<div class="alc-alert is-strong">Fallback local: Mover e Excluir disponiveis. Lixeira exige o app desktop nativo.</div>`;
   const userWarning = userContentCount
     ? `<div class="alc-alert is-strong">Usuario ${formatNumber(userContentCount)}</div>`
     : "";
 
   return `
     <section class="alc-console">
+      ${renderAlcSafetyNotice(userContentCount, sourceCandidates.length)}
       ${nativeWarning}
       ${estimateWarning}
       ${expansionWarning}
@@ -3313,12 +3314,16 @@ function renderAlcModal() {
       </div>
       <div class="alc-control-grid" role="radiogroup" aria-label="Destino do A.L.C">
         <label class="alc-target-card">
-          <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "trash" ? "" : " checked"}>
-          <span><b>Mover</b></span>
+          <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "delete" || (nativeExecutor && state.alcDraft.targetKind === "trash") ? "" : " checked"}>
+          <span><b>Mover</b><small>preserva arquivos fora da raiz</small></span>
         </label>
         <label class="alc-target-card">
-          <input type="radio" name="alcTargetKind" value="trash"${state.alcDraft.targetKind === "trash" ? " checked" : ""}>
-          <span><b>Lixeira</b></span>
+          <input type="radio" name="alcTargetKind" value="trash"${nativeExecutor && state.alcDraft.targetKind === "trash" ? " checked" : ""}${nativeExecutor ? "" : " disabled"}>
+          <span><b>Lixeira</b><small>${nativeExecutor ? "reversivel, nao libera tudo" : "somente app desktop"}</small></span>
+        </label>
+        <label class="alc-target-card">
+          <input type="radio" name="alcTargetKind" value="delete"${state.alcDraft.targetKind === "delete" ? " checked" : ""}>
+          <span><b>Excluir</b><small>definitivo e mais rapido</small></span>
         </label>
       </div>
       <div id="alcDestinationBlock" class="alc-destination">
@@ -3344,8 +3349,26 @@ function renderAlcModal() {
       <div id="alcResult" class="alc-result is-hidden"></div>
       <div class="alc-footer">
         <p class="muted"></p>
-        <button id="executeAlcButton" class="primary-button" type="button"${nativeExecutor ? "" : " disabled"}>Mover</button>
+        <button id="executeAlcButton" class="primary-button" type="button">Executar</button>
       </div>
+    </section>
+  `;
+}
+
+function renderAlcSafetyNotice(userContentCount, candidateCount) {
+  return `
+    <section class="alc-safety-notice" aria-label="Avisos importantes do A.L.C">
+      <div>
+        <strong>Avisos importantes</strong>
+        <p>Arquivos temporarios, caches, logs, instaladores, compactados antigos, downloads e itens de baixo uso podem ser movidos, enviados para a lixeira ou excluidos quando voce confirmar.</p>
+      </div>
+      <ul>
+        <li>Revise documentos, fotos, videos, projetos, saves, backups e qualquer pasta sincronizada antes de executar.</li>
+        <li>E recomendado isentar pastas de trabalho, clientes, estudos, repositorios ativos, nuvem e qualquer diretorio que voce nao quer tocar.</li>
+        <li>Para liberar espaco rapido de verdade, use Excluir; Lixeira ainda ocupa espaco no disco ate ser esvaziada.</li>
+        <li>Garantia operacional: o A.L.C nao age sozinho; ele respeita isencoes, mostra a fila e so executa depois da sua confirmacao.</li>
+      </ul>
+      <small>${formatNumber(candidateCount)} candidato(s) na fila atual; ${formatNumber(userContentCount)} parecem conteudo do usuario.</small>
     </section>
   `;
 }
@@ -3383,6 +3406,7 @@ function renderExemptionManager() {
       <div class="are-section-heading">
         <div>
           <h3>Isentas</h3>
+          <p class="muted">Proteja pastas importantes antes de mover arquivos. Exemplos: Documents, Desktop, Pictures, OneDrive, projetos ativos, backups, clientes e saves.</p>
         </div>
       </div>
       <div class="input-action-row">
@@ -3721,7 +3745,7 @@ function wireAlcModalControls() {
     const bytes = selected.reduce((sum, item) => sum + candidateBytes(item), 0);
     const plannedBytes = activeAlcTargetBytes();
     const canExecutePlan = alcExecutionFiltersAreBroad() && plannedBytes > 0;
-    const hasDestination = kind === "trash" || Boolean(destinationInput?.value.trim());
+    const hasDestination = kind !== "directory" || Boolean(destinationInput?.value.trim());
     if (destinationBlock) {
       destinationBlock.style.display = kind === "directory" ? "grid" : "none";
     }
@@ -3731,7 +3755,7 @@ function wireAlcModalControls() {
         : `${formatNumber(selected.length)} / ${formatBytes(bytes)}`;
     }
     if (executeButton) {
-      executeButton.disabled = !isNativeMaidSpace() || (!selected.length && !canExecutePlan) || !hasDestination;
+      executeButton.disabled = (!selected.length && !canExecutePlan) || !hasDestination;
     }
   };
 
@@ -4229,15 +4253,29 @@ async function executeAlcRelocation() {
     return;
   }
 
-  const actionLabel = targetKind === "trash" ? "enviar para a lixeira" : "mover para o destino";
+  const actionLabel = targetKind === "delete"
+    ? "excluir definitivamente"
+    : targetKind === "trash"
+      ? "enviar para a lixeira"
+      : "mover para o destino";
+  const destructiveWarning = targetKind === "delete"
+    ? "\n- Excluir e definitivo: os arquivos nao vao para a lixeira e o espaco e liberado imediatamente."
+    : "";
+  const importantTypesWarning = [
+    "ATENCAO IMPORTANTE:",
+    "- Podem sair da pasta: temporarios, caches, logs, instaladores, compactados antigos, downloads e arquivos grandes/pouco usados.",
+    "- Revise com cuidado: documentos, fotos, videos, projetos, backups, saves e pastas sincronizadas.",
+    "- Recomendado: isente pastas pessoais ou de trabalho antes de continuar.",
+    `- Garantia operacional: o A.L.C so executa apos esta confirmacao e respeita as isencoes salvas.${destructiveWarning}`
+  ].join("\n");
   const warning = userContentCount
-    ? `\n\nATENCAO: ${userContentCount} arquivo(s) parecem conteudo criado pelo usuario.`
+    ? `\n\n${userContentCount} arquivo(s) parecem conteudo criado pelo usuario.`
     : "";
   const exemptions = Object.keys(state.preferences.exemptDirectories || {}).length;
   const planWarning = executeByPlan
     ? `\n\nO A.L.C vai expandir o plano ${modeLabel(planMode)} no nativo ate aproximadamente ${formatBytes(planTargetBytes)}. A lista visivel e apenas a previa.`
     : "";
-  const confirmed = window.confirm(`Confirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
+  const confirmed = window.confirm(`${importantTypesWarning}\n\nConfirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
   if (!confirmed) {
     return;
   }
@@ -4245,7 +4283,7 @@ async function executeAlcRelocation() {
   const executeButton = body.querySelector("#executeAlcButton");
   if (executeButton) {
     executeButton.disabled = true;
-    executeButton.textContent = "Movendo";
+    executeButton.textContent = targetKind === "delete" ? "Excluindo" : targetKind === "trash" ? "Enviando" : "Movendo";
   }
   state.alcCancelRequested = false;
   state.alcProgress = normalizeAlcProgress({
@@ -4291,7 +4329,7 @@ async function executeAlcRelocation() {
       cancelled: Boolean(report.cancelled)
     });
     updateAlcProgressPanel();
-    appendSystemLog(`A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} realocados.`);
+    appendSystemLog(`A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
     showAlcResult(report);
     executionCompleted = !report.cancelled;
   } catch (error) {
@@ -4300,7 +4338,7 @@ async function executeAlcRelocation() {
   } finally {
     await stopAlcProgressListener();
     if (executeButton) {
-      executeButton.textContent = "Mover";
+      executeButton.textContent = "Executar";
       executeButton.disabled = executionCompleted;
     }
     state.alcCancelRequested = false;
@@ -4326,17 +4364,33 @@ function showAlcResult(report, error = null) {
   if (report.cancelled) {
     result.innerHTML = `
       <strong>Cancelado</strong>
-      <span>${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)}.</span>
+      <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${alcReportActionLabel(report)}, ${formatBytes(report.movedBytes || 0)}.</span>
       <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s).</span>
     `;
     return;
   }
 
+  const actionLabel = alcReportActionLabel(report);
+  const spaceLabel = report.targetKind === "delete"
+    ? "liberados do disco"
+    : report.targetKind === "trash"
+      ? "enviados para a lixeira"
+      : "retirados da raiz";
   result.innerHTML = `
     <strong>A.L.C concluido</strong>
-    <span>${formatNumber(report.movedFiles || 0)} arquivo(s) realocados, ${formatBytes(report.movedBytes || 0)} retirados da raiz.</span>
+    <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${actionLabel}, ${formatBytes(report.movedBytes || 0)} ${spaceLabel}.</span>
     <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o A.D.D/A.R.E.</span>
   `;
+}
+
+function alcReportActionLabel(report) {
+  if (report?.targetKind === "delete") {
+    return "excluidos definitivamente";
+  }
+  if (report?.targetKind === "trash") {
+    return "enviados para a lixeira";
+  }
+  return "realocados";
 }
 
 function candidateBytes(item) {

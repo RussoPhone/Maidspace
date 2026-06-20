@@ -88,6 +88,50 @@ struct AlcOperationReport {
 }
 
 const MAX_OPERATION_REPORTS: usize = 5_000;
+const ALC_TRASH_BATCH_SIZE: usize = 256;
+const ALC_PROGRESS_FILE_INTERVAL: usize = 64;
+const ALC_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
+const ALC_COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+struct PreparedAlcFile {
+    source: PathBuf,
+    relative: PathBuf,
+    operation: AlcOperationReport,
+}
+
+struct AlcProgressTicker {
+    last_emit: Instant,
+}
+
+impl AlcProgressTicker {
+    fn new() -> Self {
+        Self {
+            last_emit: Instant::now()
+                .checked_sub(ALC_PROGRESS_TIME_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn emit(
+        &mut self,
+        app: &AppHandle,
+        phase: &str,
+        current_file: Option<&str>,
+        index: usize,
+        total: usize,
+        report: &AlcRelocationReport,
+        target_bytes: u64,
+        force: bool,
+    ) {
+        if force
+            || index % ALC_PROGRESS_FILE_INTERVAL == 0
+            || self.last_emit.elapsed() >= ALC_PROGRESS_TIME_INTERVAL
+        {
+            emit_alc_progress(app, phase, current_file, index, total, report, target_bytes);
+            self.last_emit = Instant::now();
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -452,7 +496,7 @@ fn execute_alc_relocation(
     }
 
     let target_kind = request.target_kind.trim().to_ascii_lowercase();
-    if target_kind != "directory" && target_kind != "trash" {
+    if target_kind != "directory" && target_kind != "trash" && target_kind != "delete" {
         return Err(String::from("Destino A.L.C invalido."));
     }
 
@@ -484,7 +528,8 @@ fn execute_alc_relocation(
         .fold(0u64, |sum, file| sum.saturating_add(file.size.unwrap_or(0)));
     let target_bytes = request.target_bytes.unwrap_or(0);
     let should_expand_plan = request.expand_plan.unwrap_or(false)
-        || (target_bytes > 0 && requested_preview_bytes < target_bytes.saturating_sub(target_bytes / 50));
+        || (target_bytes > 0
+            && requested_preview_bytes < target_bytes.saturating_sub(target_bytes / 50));
 
     let mut report = AlcRelocationReport {
         target_kind: target_kind.clone(),
@@ -517,40 +562,73 @@ fn execute_alc_relocation(
         progress_target_bytes,
     );
 
+    let mut progress_ticker = AlcProgressTicker::new();
+    let mut trash_batch = Vec::with_capacity(ALC_TRASH_BATCH_SIZE);
+    let mut created_directories = HashSet::new();
+
     for (index, file) in files.into_iter().enumerate() {
         if ALC_CANCELLED.load(Ordering::Relaxed) {
             report.cancelled = true;
             break;
         }
-        emit_alc_progress(
+
+        if let Some(prepared) = prepare_alc_file(&root, file, &mut report, &mut seen) {
+            if target_kind == "trash" {
+                trash_batch.push(prepared);
+                if trash_batch.len() >= ALC_TRASH_BATCH_SIZE {
+                    flush_trash_batch(&mut trash_batch, &mut report);
+                }
+            } else if target_kind == "delete" {
+                delete_prepared_file(prepared, &mut report);
+            } else {
+                move_prepared_file_to_directory(
+                    target_directory.as_deref(),
+                    prepared,
+                    &mut report,
+                    &mut created_directories,
+                );
+            }
+        }
+
+        progress_ticker.emit(
             &app,
             "move",
-            Some(&file.relative_path),
+            report
+                .operations
+                .last()
+                .map(|operation| operation.relative_path.as_str()),
             index + 1,
             total_preview_files,
             &report,
             progress_target_bytes,
-        );
-        relocate_alc_file(
-            &root,
-            &target_kind,
-            target_directory.as_deref(),
-            file,
-            &mut report,
-            &mut seen,
-        );
-        emit_alc_progress(
-            &app,
-            "moved",
-            report.operations.last().map(|operation| operation.relative_path.as_str()),
-            index + 1,
-            total_preview_files,
-            &report,
-            progress_target_bytes,
+            false,
         );
     }
 
-    if !report.cancelled && should_expand_plan && target_bytes > 0 && report.moved_bytes < target_bytes {
+    if report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed) {
+        cancel_trash_batch(&mut trash_batch, &mut report);
+    } else {
+        flush_trash_batch(&mut trash_batch, &mut report);
+    }
+    progress_ticker.emit(
+        &app,
+        "move",
+        report
+            .operations
+            .last()
+            .map(|operation| operation.relative_path.as_str()),
+        total_preview_files,
+        total_preview_files,
+        &report,
+        progress_target_bytes,
+        true,
+    );
+
+    if !report.cancelled
+        && should_expand_plan
+        && target_bytes > 0
+        && report.moved_bytes < target_bytes
+    {
         stream_relocate_alc_plan(
             &app,
             &root,
@@ -567,7 +645,11 @@ fn execute_alc_relocation(
     report.cancelled = report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed);
     emit_alc_progress(
         &app,
-        if report.cancelled { "cancelled" } else { "done" },
+        if report.cancelled {
+            "cancelled"
+        } else {
+            "done"
+        },
         None,
         report.requested_files,
         report.requested_files,
@@ -629,14 +711,12 @@ fn reveal_in_explorer(root_path: String, relative_path: String) -> Result<(), St
     Ok(())
 }
 
-fn relocate_alc_file(
+fn prepare_alc_file(
     root: &Path,
-    target_kind: &str,
-    target_directory: Option<&Path>,
     file: AlcFileSelection,
     report: &mut AlcRelocationReport,
     seen: &mut HashSet<String>,
-) {
+) -> Option<PreparedAlcFile> {
     let mut operation = AlcOperationReport {
         relative_path: file.relative_path.clone(),
         size_bytes: file.size.unwrap_or(0),
@@ -652,7 +732,7 @@ fn relocate_alc_file(
         report.cancelled = true;
         report.cancelled_files += 1;
         push_operation_report(report, operation);
-        return;
+        return None;
     }
 
     let relative = match safe_relative_path(&file.relative_path) {
@@ -661,12 +741,12 @@ fn relocate_alc_file(
             operation.error = Some(error);
             report.failed_files += 1;
             push_operation_report(report, operation);
-            return;
+            return None;
         }
     };
     let relative_key = normalize_preference_key(&relative.display().to_string());
     if !seen.insert(relative_key) {
-        return;
+        return None;
     }
     report.requested_files += 1;
 
@@ -676,7 +756,7 @@ fn relocate_alc_file(
             operation.error = Some(format!("Arquivo indisponivel: {error}"));
             report.failed_files += 1;
             push_operation_report(report, operation);
-            return;
+            return None;
         }
     };
 
@@ -684,7 +764,7 @@ fn relocate_alc_file(
         operation.error = Some(String::from("Arquivo fora da raiz varrida."));
         report.failed_files += 1;
         push_operation_report(report, operation);
-        return;
+        return None;
     }
 
     let metadata = match fs::metadata(&source) {
@@ -693,7 +773,7 @@ fn relocate_alc_file(
             operation.error = Some(format!("Falha ao ler metadados: {error}"));
             report.failed_files += 1;
             push_operation_report(report, operation);
-            return;
+            return None;
         }
     };
 
@@ -702,33 +782,41 @@ fn relocate_alc_file(
         operation.error = Some(String::from("A.L.C MVP move apenas arquivos."));
         report.skipped_files += 1;
         push_operation_report(report, operation);
-        return;
+        return None;
     }
 
     operation.size_bytes = metadata.len();
+    Some(PreparedAlcFile {
+        source,
+        relative,
+        operation,
+    })
+}
 
-    let result = if target_kind == "trash" {
-        trash::delete(&source)
-            .map(|_| {
-                operation.status = String::from("trashed");
-                operation.target_path = Some(String::from("lixeira"));
-            })
-            .map_err(|error| error.to_string())
-    } else {
-        let Some(target_root) = target_directory else {
-            operation.error = Some(String::from("Destino A.L.C ausente."));
-            report.failed_files += 1;
-            push_operation_report(report, operation);
-            return;
-        };
-        let destination = unique_destination(&target_root.join(&relative));
-        move_file_to(&source, &destination)
-            .map(|_| {
-                operation.status = String::from("moved");
-                operation.target_path = Some(destination.display().to_string());
-            })
-            .map_err(|error| error.to_string())
+fn move_prepared_file_to_directory(
+    target_directory: Option<&Path>,
+    prepared: PreparedAlcFile,
+    report: &mut AlcRelocationReport,
+    created_directories: &mut HashSet<PathBuf>,
+) {
+    let PreparedAlcFile {
+        source,
+        relative,
+        mut operation,
+    } = prepared;
+    let Some(target_root) = target_directory else {
+        operation.error = Some(String::from("Destino A.L.C ausente."));
+        report.failed_files += 1;
+        push_operation_report(report, operation);
+        return;
     };
+    let destination = unique_destination(&target_root.join(&relative));
+    let result = move_file_to(&source, &destination, created_directories)
+        .map(|_| {
+            operation.status = String::from("moved");
+            operation.target_path = Some(destination.display().to_string());
+        })
+        .map_err(|error| error.to_string());
 
     match result {
         Ok(()) => {
@@ -752,6 +840,120 @@ fn relocate_alc_file(
     push_operation_report(report, operation);
 }
 
+fn delete_prepared_file(prepared: PreparedAlcFile, report: &mut AlcRelocationReport) {
+    if ALC_CANCELLED.load(Ordering::Relaxed) {
+        mark_prepared_cancelled(prepared, report);
+        return;
+    }
+
+    let result = fs::remove_file(&prepared.source).map_err(|error| error.to_string());
+    match result {
+        Ok(()) => {
+            let mut operation = prepared.operation;
+            operation.status = String::from("deleted");
+            operation.target_path = Some(String::from("excluido"));
+            report.moved_files += 1;
+            report.moved_bytes = report.moved_bytes.saturating_add(operation.size_bytes);
+            push_operation_report(report, operation);
+        }
+        Err(error) => {
+            if ALC_CANCELLED.load(Ordering::Relaxed) || error == "Cancelado." {
+                mark_prepared_cancelled(prepared, report);
+            } else {
+                mark_prepared_failed(prepared, report, error);
+            }
+        }
+    }
+}
+
+fn flush_trash_batch(batch: &mut Vec<PreparedAlcFile>, report: &mut AlcRelocationReport) {
+    if batch.is_empty() {
+        return;
+    }
+    if ALC_CANCELLED.load(Ordering::Relaxed) {
+        cancel_trash_batch(batch, report);
+        return;
+    }
+
+    let files = std::mem::take(batch);
+    let paths: Vec<PathBuf> = files.iter().map(|item| item.source.clone()).collect();
+    match trash::delete_all(paths.iter()) {
+        Ok(()) => {
+            for prepared in files {
+                mark_prepared_trashed(prepared, report);
+            }
+        }
+        Err(error) => {
+            trash_files_individually(files, report, error.to_string());
+        }
+    }
+}
+
+fn trash_files_individually(
+    files: Vec<PreparedAlcFile>,
+    report: &mut AlcRelocationReport,
+    batch_error: String,
+) {
+    for prepared in files {
+        if ALC_CANCELLED.load(Ordering::Relaxed) {
+            mark_prepared_cancelled(prepared, report);
+            continue;
+        }
+        if !prepared.source.exists() {
+            mark_prepared_trashed(prepared, report);
+            continue;
+        }
+        let result = trash::delete(&prepared.source).map_err(|error| error.to_string());
+        match result {
+            Ok(()) => mark_prepared_trashed(prepared, report),
+            Err(error) => {
+                let message = if error.is_empty() {
+                    batch_error.clone()
+                } else {
+                    error
+                };
+                mark_prepared_failed(prepared, report, message);
+            }
+        }
+    }
+}
+
+fn mark_prepared_trashed(prepared: PreparedAlcFile, report: &mut AlcRelocationReport) {
+    let mut operation = prepared.operation;
+    operation.status = String::from("trashed");
+    operation.target_path = Some(String::from("lixeira"));
+    report.moved_files += 1;
+    report.moved_bytes = report.moved_bytes.saturating_add(operation.size_bytes);
+    push_operation_report(report, operation);
+}
+
+fn mark_prepared_failed(
+    prepared: PreparedAlcFile,
+    report: &mut AlcRelocationReport,
+    error: String,
+) {
+    let mut operation = prepared.operation;
+    operation.status = String::from("failed");
+    operation.error = Some(error);
+    report.failed_files += 1;
+    push_operation_report(report, operation);
+}
+
+fn mark_prepared_cancelled(prepared: PreparedAlcFile, report: &mut AlcRelocationReport) {
+    let mut operation = prepared.operation;
+    operation.status = String::from("cancelled");
+    operation.error = Some(String::from("Cancelado."));
+    report.cancelled = true;
+    report.cancelled_files += 1;
+    push_operation_report(report, operation);
+}
+
+fn cancel_trash_batch(batch: &mut Vec<PreparedAlcFile>, report: &mut AlcRelocationReport) {
+    for prepared in std::mem::take(batch) {
+        mark_prepared_cancelled(prepared, report);
+    }
+}
+
 fn stream_relocate_alc_plan(
     app: &AppHandle,
     root: &Path,
@@ -766,6 +968,10 @@ fn stream_relocate_alc_plan(
     let preferences = root_preferences_from_store(&read_preferences_store()?, root_path);
     let mode = normalize_alc_mode(plan_mode);
     let mut stack = VecDeque::from([root.to_path_buf()]);
+    let mut progress_ticker = AlcProgressTicker::new();
+    let mut trash_batch = Vec::with_capacity(ALC_TRASH_BATCH_SIZE);
+    let mut pending_trash_bytes = 0u64;
+    let mut created_directories = HashSet::new();
     emit_alc_progress(
         app,
         "expand",
@@ -781,7 +987,7 @@ fn stream_relocate_alc_plan(
             report.cancelled = true;
             break;
         }
-        if report.moved_bytes >= target_bytes {
+        if report.moved_bytes.saturating_add(pending_trash_bytes) >= target_bytes {
             break;
         }
         let entries = match fs::read_dir(&directory) {
@@ -790,7 +996,7 @@ fn stream_relocate_alc_plan(
         };
 
         for entry in entries.flatten() {
-            if report.moved_bytes >= target_bytes {
+            if report.moved_bytes.saturating_add(pending_trash_bytes) >= target_bytes {
                 break;
             }
             if ALC_CANCELLED.load(Ordering::Relaxed) {
@@ -857,36 +1063,82 @@ fn stream_relocate_alc_plan(
                 .ok()
                 .map(days_since_system_time)
                 .unwrap_or(31);
-            let Some(cleanup_mode) = alc_cleanup_mode(&normalized_relative, &extension, size, days) else {
+            let Some(cleanup_mode) = alc_cleanup_mode(&normalized_relative, &extension, size, days)
+            else {
                 continue;
             };
             if !cleanup_mode_included(&mode, cleanup_mode) {
                 continue;
             }
 
-            relocate_alc_file(
+            if let Some(prepared) = prepare_alc_file(
                 root,
-                target_kind,
-                target_directory,
                 AlcFileSelection {
                     relative_path: relative,
                     size: Some(size),
-                    user_content: Some(is_user_content_path_native(&normalized_relative, &extension)),
+                    user_content: Some(is_user_content_path_native(
+                        &normalized_relative,
+                        &extension,
+                    )),
                 },
                 report,
                 seen,
-            );
-            emit_alc_progress(
+            ) {
+                if target_kind == "trash" {
+                    pending_trash_bytes =
+                        pending_trash_bytes.saturating_add(prepared.operation.size_bytes);
+                    trash_batch.push(prepared);
+                    if trash_batch.len() >= ALC_TRASH_BATCH_SIZE
+                        || report.moved_bytes.saturating_add(pending_trash_bytes) >= target_bytes
+                    {
+                        flush_trash_batch(&mut trash_batch, report);
+                        pending_trash_bytes = 0;
+                    }
+                } else if target_kind == "delete" {
+                    delete_prepared_file(prepared, report);
+                } else {
+                    move_prepared_file_to_directory(
+                        target_directory,
+                        prepared,
+                        report,
+                        &mut created_directories,
+                    );
+                }
+            }
+            progress_ticker.emit(
                 app,
                 "move",
-                report.operations.last().map(|operation| operation.relative_path.as_str()),
+                report
+                    .operations
+                    .last()
+                    .map(|operation| operation.relative_path.as_str()),
                 report.requested_files,
                 report.requested_files,
                 report,
                 target_bytes,
+                false,
             );
         }
     }
+
+    if report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed) {
+        cancel_trash_batch(&mut trash_batch, report);
+    } else {
+        flush_trash_batch(&mut trash_batch, report);
+    }
+    progress_ticker.emit(
+        app,
+        "move",
+        report
+            .operations
+            .last()
+            .map(|operation| operation.relative_path.as_str()),
+        report.requested_files,
+        report.requested_files,
+        report,
+        target_bytes,
+        true,
+    );
 
     Ok(())
 }
@@ -1403,9 +1655,15 @@ fn unique_destination(base: &Path) -> PathBuf {
     parent.join(format!("{file_name}.maidspace-final"))
 }
 
-fn move_file_to(source: &Path, destination: &Path) -> io::Result<()> {
+fn move_file_to(
+    source: &Path,
+    destination: &Path,
+    created_directories: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        if created_directories.insert(parent.to_path_buf()) {
+            fs::create_dir_all(parent)?;
+        }
     }
 
     if ALC_CANCELLED.load(Ordering::Relaxed) {
@@ -1435,7 +1693,7 @@ fn move_file_to(source: &Path, destination: &Path) -> io::Result<()> {
 fn copy_file_cancellable(source: &Path, destination: &Path) -> io::Result<u64> {
     let mut input = fs::File::open(source)?;
     let mut output = fs::File::create(destination)?;
-    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; ALC_COPY_BUFFER_BYTES];
     let mut written = 0u64;
 
     loop {
@@ -1451,7 +1709,7 @@ fn copy_file_cancellable(source: &Path, destination: &Path) -> io::Result<u64> {
         written = written.saturating_add(read as u64);
     }
 
-    output.sync_all()?;
+    output.flush()?;
     Ok(written)
 }
 

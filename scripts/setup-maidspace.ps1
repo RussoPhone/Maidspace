@@ -33,6 +33,14 @@ if (-not (Test-Command "cargo")) {
   Add-PathIfExists "$env:USERPROFILE\.cargo\bin"
 }
 
+if (Test-Command "rustup") {
+  $rustupShow = rustup show 2>$null | Out-String
+  if ($rustupShow -match "no active toolchain") {
+    Write-Host "Ativando Rust stable para o MaidSpace..."
+    rustup default stable
+  }
+}
+
 Write-Host "Instalando dependencias npm..."
 npm install
 

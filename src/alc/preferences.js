@@ -6,7 +6,7 @@ const STORE_VERSION = 1;
 
 async function loadRootPreferences(rootPath) {
   const store = await readStore();
-  return cloneRootPreferences(store.roots[rootKey(rootPath)]);
+  return cloneRootPreferences(mergeRootPreferences(rootKeyAliases(rootPath).map((key) => store.roots[key])));
 }
 
 async function saveFileDecision(rootPath, relativePath, decision, metadata = {}) {
@@ -165,14 +165,47 @@ function countBy(items, field) {
 }
 
 function cloneRootPreferences(root = {}) {
+  const fileDecisions = {};
+  for (const [key, value] of Object.entries(root.fileDecisions || {})) {
+    const normalized = normalizeRelative(key);
+    if (normalized) {
+      fileDecisions[normalized] = value;
+    }
+  }
+  const exemptDirectories = {};
+  for (const [key, value] of Object.entries(root.exemptDirectories || {})) {
+    const normalized = normalizeRelative(key);
+    if (normalized) {
+      exemptDirectories[normalized] = {
+        ...(value || {}),
+        path: normalized
+      };
+    }
+  }
   return {
     schemaVersion: STORE_VERSION,
-    fileDecisions: { ...(root.fileDecisions || {}) },
-    exemptDirectories: { ...(root.exemptDirectories || {}) },
+    fileDecisions,
+    exemptDirectories,
     targetFreeBytes: Number(root.targetFreeBytes || 0),
     minimumFreeBytes: Number(root.minimumFreeBytes || 0),
     updatedAt: root.updatedAt || null
   };
+}
+
+function mergeRootPreferences(roots = []) {
+  return roots.filter(Boolean).reduce((merged, root) => ({
+    fileDecisions: {
+      ...(merged.fileDecisions || {}),
+      ...(root.fileDecisions || {})
+    },
+    exemptDirectories: {
+      ...(merged.exemptDirectories || {}),
+      ...(root.exemptDirectories || {})
+    },
+    targetFreeBytes: Math.max(Number(merged.targetFreeBytes || 0), Number(root.targetFreeBytes || 0)),
+    minimumFreeBytes: Math.max(Number(merged.minimumFreeBytes || 0), Number(root.minimumFreeBytes || 0)),
+    updatedAt: root.updatedAt || merged.updatedAt || null
+  }), {});
 }
 
 function ensureRoot(store, rootPath) {
@@ -217,6 +250,20 @@ function preferencesFilePath() {
 
 function rootKey(rootPath) {
   return path.resolve(rootPath || ".").replace(/\\/g, "/").toLowerCase();
+}
+
+function rootKeyAliases(rootPath) {
+  const key = rootKey(rootPath);
+  const aliases = new Set([key]);
+  const driveMatch = key.match(/^([a-z]):\/?$/i);
+  if (driveMatch) {
+    aliases.add(`//?/${driveMatch[1].toLowerCase()}:/`);
+  }
+  const verbatimDriveMatch = key.match(/^\/\/\?\/([a-z]):\/?$/i);
+  if (verbatimDriveMatch) {
+    aliases.add(`${verbatimDriveMatch[1].toLowerCase()}:/`);
+  }
+  return Array.from(aliases);
 }
 
 function normalizeRelative(value) {

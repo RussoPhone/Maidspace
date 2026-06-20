@@ -6,7 +6,7 @@ const path = require("node:path");
 const { analyzeDirectory } = require("../src/add/analyzer");
 const { generateRelocationPlan } = require("../src/are/planner");
 const { applyPreferencesToAddReport } = require("../src/alc/preferences");
-const { runSrcPipeline, runSrcPipelineProgressive } = require("../server");
+const { createAppServer, runSrcPipeline, runSrcPipelineProgressive } = require("../server");
 
 test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-"));
@@ -587,4 +587,63 @@ test("Varredura turbo inventaria metadados sem bloquear no grafo profundo", asyn
   assert.equal(result.relocationPlan.summary.inventoryProvider, "robocopy");
   assert.equal(result.relocationPlan.summary.totalBytes, result.summary.totalBytes);
   assert.ok(result.relocationPlan.summary.reallocatable.alto >= 32 * 1024);
+});
+
+test("A.L.C fallback move e exclui arquivos via HTTP", async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-alc-http-"));
+  const root = path.join(base, "root");
+  const destination = path.join(base, "dest");
+  const server = createAppServer();
+
+  try {
+    await fs.mkdir(root, { recursive: true });
+    await fs.mkdir(destination, { recursive: true });
+    await fs.writeFile(path.join(root, "move-me.txt"), "move");
+    await fs.writeFile(path.join(root, "delete-me.txt"), "delete");
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    const postRelocate = async (request) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/relocate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request })
+      });
+      const payload = await response.json();
+      assert.equal(response.ok, true, payload.error || "falha HTTP");
+      return payload;
+    };
+
+    const moveReport = await postRelocate({
+      rootPath: root,
+      targetKind: "directory",
+      targetDirectory: destination,
+      files: [{ relativePath: "move-me.txt" }]
+    });
+    assert.equal(moveReport.movedFiles, 1);
+    await assert.rejects(fs.access(path.join(root, "move-me.txt")));
+    await fs.access(path.join(destination, "move-me.txt"));
+
+    const deleteReport = await postRelocate({
+      rootPath: root,
+      targetKind: "delete",
+      files: [{ relativePath: "delete-me.txt" }]
+    });
+    assert.equal(deleteReport.movedFiles, 1);
+    await assert.rejects(fs.access(path.join(root, "delete-me.txt")));
+
+    await fs.writeFile(path.join(root, "expand-me.tmp"), "expand");
+    const expandReport = await postRelocate({
+      rootPath: root,
+      targetKind: "delete",
+      planMode: "alto",
+      targetBytes: 1,
+      expandPlan: true,
+      files: []
+    });
+    assert.equal(expandReport.movedFiles, 1);
+    await assert.rejects(fs.access(path.join(root, "expand-me.tmp")));
+  } finally {
+    server.close();
+    await fs.rm(base, { recursive: true, force: true });
+  }
 });

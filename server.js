@@ -1,5 +1,6 @@
 const http = require("node:http");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const path = require("node:path");
 const { once } = require("node:events");
 const {
@@ -117,6 +118,12 @@ function createAppServer() {
         return sendJson(response, 200, result);
       }
 
+      if (request.method === "POST" && request.url === "/api/alc/relocate") {
+        const body = await readJsonBody(request, { limitBytes: 64 * 1024 * 1024 });
+        const report = await executeAlcRelocationServer(body.request || {});
+        return sendJson(response, 200, report);
+      }
+
       if (request.method !== "GET") {
         return sendJson(response, 405, { error: "Metodo nao suportado." });
       }
@@ -215,6 +222,273 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
     preferences,
     report
   };
+}
+
+async function executeAlcRelocationServer(request = {}) {
+  const rootPath = request.rootPath || defaultRootPath();
+  const root = await realpathOrResolve(rootPath);
+  const rootStats = await fs.stat(root);
+  if (!rootStats.isDirectory()) {
+    throw new Error(`A raiz nao e um diretorio: ${root}`);
+  }
+
+  const targetKind = String(request.targetKind || "directory").trim().toLowerCase();
+  if (!["directory", "trash", "delete"].includes(targetKind)) {
+    throw new Error("Destino A.L.C invalido.");
+  }
+  if (targetKind === "trash") {
+    throw new Error("Lixeira esta disponivel apenas no app desktop nativo. Use Excluir para liberar espaco ou Mover para preservar os arquivos.");
+  }
+
+  const targetDirectory = targetKind === "directory"
+    ? await prepareAlcTargetDirectory(request.targetDirectory, root)
+    : null;
+
+  const files = Array.isArray(request.files) ? request.files : [];
+  const report = {
+    targetKind,
+    targetDirectory,
+    requestedFiles: 0,
+    movedFiles: 0,
+    failedFiles: 0,
+    skippedFiles: 0,
+    cancelledFiles: 0,
+    cancelled: false,
+    movedBytes: 0,
+    operations: []
+  };
+  const seen = new Set();
+  const createdDirectories = new Set();
+  const targetBytes = Math.max(0, Number(request.targetBytes || 0));
+  const executeFile = async (file) => {
+    const prepared = await prepareAlcFileServer(root, file, report, seen);
+    if (!prepared) {
+      return;
+    }
+    if (targetKind === "delete") {
+      await deletePreparedFileServer(prepared, report);
+    } else {
+      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories);
+    }
+  };
+
+  for (const file of files) {
+    await executeFile(file);
+  }
+
+  if (request.expandPlan && targetBytes > 0 && report.movedBytes < targetBytes) {
+    const preferences = await loadRootPreferences(rootPath);
+    const expansion = await scanRelocationCandidates(root, {
+      mode: request.planMode || "alto",
+      targetBytes: targetBytes - report.movedBytes,
+      limit: request.limit || 1000000,
+      preferences,
+      options: {
+        ...DEFAULT_OPTIONS,
+        includeProgramFiles: true
+      },
+      skipDirectories: DEFAULT_OPTIONS.skipDirectories || []
+    });
+    for (const candidate of expansion.candidates || []) {
+      if (report.movedBytes >= targetBytes) {
+        break;
+      }
+      await executeFile({
+        relativePath: candidate.path,
+        size: candidateBytesServer(candidate),
+        userContent: candidate.userImpact === "alto" || candidate.userImpact === "medio"
+      });
+    }
+  }
+
+  return report;
+}
+
+async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
+  const value = String(rawTargetDirectory || "").trim();
+  if (!value) {
+    throw new Error("Escolha uma pasta de destino para o A.L.C.");
+  }
+  await fs.mkdir(value, { recursive: true });
+  const target = await realpathOrResolve(value);
+  if (pathIsInside(target, root) || target === root) {
+    throw new Error("O destino esta dentro da raiz varrida; escolha uma pasta fora dela para liberar espaco.");
+  }
+  return target;
+}
+
+async function prepareAlcFileServer(root, file = {}, report, seen) {
+  const relativePath = String(file.relativePath || file.path || "");
+  const operation = {
+    relativePath,
+    sizeBytes: Number(file.size || file.sizeBytes || 0),
+    status: "failed",
+    targetPath: null,
+    userContent: Boolean(file.userContent),
+    error: null
+  };
+
+  let relative;
+  try {
+    relative = safeRelativePathServer(relativePath);
+  } catch (error) {
+    operation.error = error.message;
+    report.failedFiles += 1;
+    pushServerOperation(report, operation);
+    return null;
+  }
+
+  const relativeKey = normalizeServerPath(relative);
+  if (seen.has(relativeKey)) {
+    return null;
+  }
+  seen.add(relativeKey);
+  report.requestedFiles += 1;
+
+  const source = path.resolve(root, relative);
+  if (!pathIsInside(source, root) && source !== root) {
+    operation.error = "Arquivo fora da raiz varrida.";
+    report.failedFiles += 1;
+    pushServerOperation(report, operation);
+    return null;
+  }
+
+  let sourceReal;
+  let stats;
+  try {
+    sourceReal = await fs.realpath(source);
+    if (!pathIsInside(sourceReal, root) && sourceReal !== root) {
+      throw new Error("Arquivo fora da raiz varrida.");
+    }
+    stats = await fs.stat(sourceReal);
+  } catch (error) {
+    operation.error = `Arquivo indisponivel: ${error.message}`;
+    report.failedFiles += 1;
+    pushServerOperation(report, operation);
+    return null;
+  }
+
+  if (!stats.isFile()) {
+    operation.status = "skipped";
+    operation.error = "A.L.C fallback move apenas arquivos.";
+    report.skippedFiles += 1;
+    pushServerOperation(report, operation);
+    return null;
+  }
+
+  operation.sizeBytes = stats.size;
+  return {
+    source: sourceReal,
+    relative,
+    operation
+  };
+}
+
+async function movePreparedFileServer(prepared, targetDirectory, report, createdDirectories) {
+  const destination = uniqueDestinationServer(path.join(targetDirectory, prepared.relative));
+  const parent = path.dirname(destination);
+  try {
+    if (!createdDirectories.has(parent)) {
+      await fs.mkdir(parent, { recursive: true });
+      createdDirectories.add(parent);
+    }
+    await moveFileServer(prepared.source, destination);
+    prepared.operation.status = "moved";
+    prepared.operation.targetPath = destination;
+    report.movedFiles += 1;
+    report.movedBytes += prepared.operation.sizeBytes;
+  } catch (error) {
+    prepared.operation.status = "failed";
+    prepared.operation.error = error.message;
+    report.failedFiles += 1;
+  }
+  pushServerOperation(report, prepared.operation);
+}
+
+async function deletePreparedFileServer(prepared, report) {
+  try {
+    await fs.rm(prepared.source, { force: true });
+    prepared.operation.status = "deleted";
+    prepared.operation.targetPath = "excluido";
+    report.movedFiles += 1;
+    report.movedBytes += prepared.operation.sizeBytes;
+  } catch (error) {
+    prepared.operation.status = "failed";
+    prepared.operation.error = error.message;
+    report.failedFiles += 1;
+  }
+  pushServerOperation(report, prepared.operation);
+}
+
+async function moveFileServer(source, destination) {
+  try {
+    await fs.rename(source, destination);
+  } catch (renameError) {
+    await fs.copyFile(source, destination);
+    try {
+      await fs.rm(source, { force: true });
+    } catch (removeError) {
+      await fs.rm(destination, { force: true }).catch(() => {});
+      throw removeError;
+    }
+    if (renameError?.code && renameError.code !== "EXDEV") {
+      return;
+    }
+  }
+}
+
+function safeRelativePathServer(rawPath) {
+  if (!rawPath) {
+    throw new Error("Caminho vazio.");
+  }
+  const normalized = String(rawPath).replace(/\\/g, "/");
+  if (path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
+    throw new Error("Caminho absoluto nao e aceito pelo A.L.C.");
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("Caminho relativo inseguro.");
+  }
+  return path.join(...parts);
+}
+
+function pathIsInside(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+async function realpathOrResolve(rawPath) {
+  const resolved = path.resolve(rawPath);
+  return fs.realpath(resolved).catch(() => resolved);
+}
+
+function normalizeServerPath(value) {
+  return String(value || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function candidateBytesServer(candidate) {
+  return Number(candidate?.packageBytes || candidate?.sizeBytes || candidate?.bytes || 0);
+}
+
+function uniqueDestinationServer(base) {
+  if (!fsSync.existsSync(base)) {
+    return base;
+  }
+  const parent = path.dirname(base);
+  const fileName = path.basename(base);
+  for (let index = 1; index < 10000; index += 1) {
+    const candidate = path.join(parent, `${fileName}.maidspace-${index}`);
+    if (!fsSync.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return path.join(parent, `${fileName}.maidspace-final`);
+}
+
+function pushServerOperation(report, operation) {
+  if (report.operations.length < 5000) {
+    report.operations.push(operation);
+  }
 }
 
 function minimalContinuousState(addReport) {
@@ -539,12 +813,12 @@ async function serveStatic(request, response) {
   }
 }
 
-function readJsonBody(request) {
+function readJsonBody(request, { limitBytes = 16 * 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
     let data = "";
     request.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 1024 * 1024) {
+      if (data.length > limitBytes) {
         request.destroy();
         reject(new Error("Corpo da requisicao muito grande."));
       }
