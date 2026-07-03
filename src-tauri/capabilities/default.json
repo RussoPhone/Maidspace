@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permite que a janela principal use comandos core necessarios para progresso em tempo real.",
+  "windows": ["*"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}
