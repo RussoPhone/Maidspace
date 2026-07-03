@@ -699,6 +699,8 @@ test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
           rootPath: root,
           targetKind: "quarantine",
           dryRun: true,
+          auditSource: "simulation",
+          auditedItemCount: 1,
           files: [{ relativePath: "cache.tmp", size: 5, risk: "baixo", reason: "teste" }]
         }
       })
@@ -709,6 +711,9 @@ test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
     assert.equal(payload.plannedFiles, 1);
     assert.equal(payload.movedFiles, 0);
     assert.ok(payload.manifestPath);
+    assert.ok(payload.manifestUsedPath);
+    assert.equal(payload.auditSource, "simulation");
+    assert.equal(payload.auditedItemCount, 1);
     assert.ok(payload.stageTimings);
     assert.ok(payload.stageTimings.planning >= 0);
     assert.ok(payload.stageTimings.logging >= 0);
@@ -747,21 +752,31 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
       rootPath: root,
       targetKind: "directory",
       targetDirectory: destination,
+      auditSource: "expanded",
+      auditedItemCount: 1,
       files: [{ relativePath: "move-me.txt" }]
     });
     assert.equal(moveReport.movedFiles, 1);
     assert.ok(moveReport.stageTimings.moving >= 0);
+    assert.equal(moveReport.auditSource, "expanded");
+    assert.equal(moveReport.auditedItemCount, 1);
+    assert.ok(moveReport.manifestUsedPath);
+    assert.equal(moveReport.volumeInfo.known, true);
     await assert.rejects(fs.access(path.join(root, "move-me.txt")));
     await fs.access(path.join(destination, "move-me.txt"));
 
     const deleteReport = await postRelocate({
       rootPath: root,
       targetKind: "delete",
+      auditSource: "expanded",
+      auditedItemCount: 1,
       files: [{ relativePath: "delete-me.tmp" }]
     });
     assert.equal(deleteReport.movedFiles, 1);
     assert.equal(deleteReport.effectiveAction, "quarantine");
     assert.ok(deleteReport.stageTimings.quarantining >= 0);
+    assert.equal(deleteReport.auditSource, "expanded");
+    assert.equal(deleteReport.auditedItemCount, 1);
     await assert.rejects(fs.access(path.join(root, "delete-me.tmp")));
     await fs.access(path.join(deleteReport.quarantineDirectory, "files", "delete-me.tmp"));
 
@@ -776,6 +791,8 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
     });
     assert.equal(expandReport.movedFiles, 1);
     assert.equal(expandReport.effectiveAction, "quarantine");
+    assert.equal(expandReport.auditedItemCount, 1);
+    assert.ok(expandReport.manifestUsedPath);
     await assert.rejects(fs.access(path.join(root, "expand-me.tmp")));
     await fs.access(path.join(expandReport.quarantineDirectory, "files", "expand-me.tmp"));
   } finally {

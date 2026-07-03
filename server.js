@@ -284,6 +284,12 @@ async function executeAlcRelocationServer(request = {}) {
     quarantineDirectory: effectiveAction === "quarantine" ? quarantineDirectory : null,
     manifestPath: null,
     finalManifestPath: null,
+    manifestUsedPath: null,
+    auditSource: String(request.auditSource || (dryRun ? "simulation" : "direct")),
+    auditManifestPath: request.auditManifestPath || null,
+    auditedItemCount: Math.max(0, Number(request.auditedItemCount || files.length || 0)),
+    auditFingerprint: request.auditFingerprint || null,
+    volumeInfo: volumeInfoForRelocation(root, targetDirectory),
     requestedFiles: 0,
     plannedFiles: 0,
     movedFiles: 0,
@@ -366,6 +372,7 @@ async function executeAlcRelocationServer(request = {}) {
     ]
   });
   report.manifestPath = await writeOperationManifest(manifest);
+  report.manifestUsedPath = report.manifestPath;
   const planningSeconds = secondsSince(planningStartedAt);
 
   if (dryRun) {
@@ -374,6 +381,8 @@ async function executeAlcRelocationServer(request = {}) {
     }
     const loggingStartedAt = Date.now();
     report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
+    report.manifestUsedPath = report.finalManifestPath || report.manifestPath;
+    report.auditedItemCount = report.plannedFiles;
     report.stageTimings = buildAlcStageTimings({
       planningSeconds,
       executionSeconds: 0,
@@ -405,6 +414,8 @@ async function executeAlcRelocationServer(request = {}) {
   manifest.status = report.failedFiles > 0 ? "completed_with_errors" : "completed";
   const loggingStartedAt = Date.now();
   report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
+  report.manifestUsedPath = report.finalManifestPath || report.manifestPath;
+  report.auditedItemCount = report.plannedFiles;
   report.stageTimings = buildAlcStageTimings({
     planningSeconds,
     executionSeconds,
@@ -428,6 +439,33 @@ function buildAlcStageTimings({ planningSeconds, executionSeconds, loggingSecond
     quarantining: !dryRun && effectiveAction === "quarantine" ? executionSeconds : 0,
     logging: loggingSeconds,
     total: totalSeconds
+  };
+}
+
+function volumeInfoForRelocation(root, targetDirectory) {
+  if (!targetDirectory) {
+    return {
+      known: false,
+      sameVolume: null,
+      sourceRoot: path.parse(root).root || null,
+      destinationRoot: null,
+      message: "destino gerenciado pelo sistema ou quarentena"
+    };
+  }
+  const sourceRoot = path.parse(root).root;
+  const destinationRoot = path.parse(targetDirectory).root;
+  const known = Boolean(sourceRoot && destinationRoot);
+  const sameVolume = known ? sourceRoot.toLowerCase() === destinationRoot.toLowerCase() : null;
+  return {
+    known,
+    sameVolume,
+    sourceRoot,
+    destinationRoot,
+    message: !known
+      ? "nao foi possivel confirmar o volume"
+      : sameVolume
+        ? "mesmo volume: move/rename tende a ser rapido"
+        : "volumes diferentes: copia e remocao podem demorar mais"
   };
 }
 

@@ -855,6 +855,67 @@ summary {
   width: min(1180px, calc(100vw - 32px));
 }
 
+.runtime-dialog-backdrop {
+  align-items: center;
+  background: rgba(20, 24, 26, 0.58);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 20px;
+  position: fixed;
+  z-index: 40;
+}
+
+.runtime-dialog {
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+  display: grid;
+  gap: 12px;
+  max-width: 520px;
+  padding: 18px;
+}
+
+.runtime-dialog h2,
+.runtime-dialog p {
+  margin: 0;
+}
+
+.runtime-dialog p {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.runtime-dialog dl {
+  background: #f7fafb;
+  display: grid;
+  gap: 6px 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+  margin: 0;
+  padding: 10px;
+}
+
+.runtime-dialog dt {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.runtime-dialog dd {
+  margin: 0;
+}
+
+.runtime-dialog-check {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.runtime-dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .relocation-modal-panel {
   width: min(1240px, calc(100vw - 32px));
 }
@@ -1387,6 +1448,35 @@ summary {
 .alc-progress-head strong {
   font-size: 20px;
   line-height: 1;
+}
+
+.alc-progress-metrics {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.alc-progress-metrics span {
+  background: #fff;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px;
+}
+
+.alc-progress-metrics b {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alc-progress-metrics small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
 }
 
 .alc-current-file {

@@ -26,6 +26,10 @@ struct AlcRelocationRequest {
     expand_plan: Option<bool>,
     dry_run: Option<bool>,
     allow_permanent_delete: Option<bool>,
+    audit_source: Option<String>,
+    audit_manifest_path: Option<String>,
+    audited_item_count: Option<usize>,
+    audit_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,12 @@ struct AlcRelocationReport {
     quarantine_directory: Option<String>,
     manifest_path: Option<String>,
     final_manifest_path: Option<String>,
+    manifest_used_path: Option<String>,
+    audit_source: String,
+    audit_manifest_path: Option<String>,
+    audited_item_count: usize,
+    audit_fingerprint: Option<String>,
+    volume_info: Value,
     requested_files: usize,
     planned_files: usize,
     moved_files: usize,
@@ -1036,6 +1046,15 @@ fn execute_alc_relocation(
             .map(|path| path.display().to_string()),
         manifest_path: None,
         final_manifest_path: None,
+        manifest_used_path: None,
+        audit_source: request
+            .audit_source
+            .clone()
+            .unwrap_or_else(|| if dry_run { String::from("simulation") } else { String::from("direct") }),
+        audit_manifest_path: request.audit_manifest_path.clone(),
+        audited_item_count: request.audited_item_count.unwrap_or(files.len()),
+        audit_fingerprint: request.audit_fingerprint.clone(),
+        volume_info: volume_info_for_relocation(&root, target_directory.as_deref()),
         requested_files: 0,
         planned_files: 0,
         moved_files: 0,
@@ -1078,6 +1097,7 @@ fn execute_alc_relocation(
         &[],
     );
     report.manifest_path = Some(write_operation_manifest(&operation_id, false, &manifest)?);
+    report.manifest_used_path = report.manifest_path.clone();
     let planning_seconds = planning_started.elapsed().as_secs_f64();
     let execution_started = Instant::now();
 
@@ -1184,6 +1204,11 @@ fn execute_alc_relocation(
         &report.operations,
     );
     report.final_manifest_path = Some(write_operation_manifest(&operation_id, true, &final_manifest)?);
+    report.manifest_used_path = report
+        .final_manifest_path
+        .clone()
+        .or_else(|| report.manifest_path.clone());
+    report.audited_item_count = report.planned_files;
     let logging_seconds = logging_started.elapsed().as_secs_f64();
     let mut moving_seconds = 0.0;
     let mut deleting_seconds = 0.0;
@@ -1834,6 +1859,41 @@ fn effective_alc_action(target_kind: &str, allow_permanent_delete: bool) -> Stri
         "delete" if allow_permanent_delete => String::from("delete_permanent"),
         _ => String::from("quarantine"),
     }
+}
+
+fn volume_info_for_relocation(root: &Path, target_directory: Option<&Path>) -> Value {
+    let source_root = path_volume_root(root);
+    let destination_root = target_directory.and_then(path_volume_root);
+    let known = source_root.is_some() && destination_root.is_some();
+    let same_volume = known
+        && source_root.as_ref().map(|item| item.to_ascii_lowercase())
+            == destination_root.as_ref().map(|item| item.to_ascii_lowercase());
+    json!({
+        "known": known,
+        "sameVolume": if known { Value::Bool(same_volume) } else { Value::Null },
+        "sourceRoot": source_root,
+        "destinationRoot": destination_root,
+        "message": if !known {
+            "destino gerenciado pelo sistema, quarentena ou volume nao confirmado"
+        } else if same_volume {
+            "mesmo volume: move/rename tende a ser rapido"
+        } else {
+            "volumes diferentes: copia e remocao podem demorar mais"
+        }
+    })
+}
+
+fn path_volume_root(path: &Path) -> Option<String> {
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                return Some(prefix.as_os_str().to_string_lossy().to_string());
+            }
+            Component::RootDir => return Some(String::from("/")),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn operation_id() -> String {
