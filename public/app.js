@@ -19,6 +19,12 @@ const state = {
   scanProgressTimer: null,
   scanProgressStartedAt: 0,
   scanProgressPercent: 0,
+  scanProgress: null,
+  scanAbortController: null,
+  scanCancelRequested: false,
+  scanJobId: null,
+  scanProgressUnlisten: null,
+  lastScanFinalReport: null,
   spaceMonitorTimer: null,
   diskStatus: null,
   lastAlcReport: null,
@@ -33,7 +39,7 @@ const state = {
     search: ""
   },
   alcDraft: {
-    targetKind: "directory",
+    targetKind: "quarantine",
     targetDirectory: ""
   },
   alcSelection: {
@@ -120,10 +126,16 @@ const elements = {
   spaceAlert: document.querySelector("#spaceAlert"),
   spaceAlertText: document.querySelector("#spaceAlertText"),
   scanButton: document.querySelector("#scanButton"),
+  cancelScanButton: document.querySelector("#cancelScanButton"),
   scanProgress: document.querySelector("#scanProgress"),
   progressLabel: document.querySelector("#progressLabel"),
   progressElapsed: document.querySelector("#progressElapsed"),
   progressBar: document.querySelector("#progressBar"),
+  progressFiles: document.querySelector("#progressFiles"),
+  progressBytes: document.querySelector("#progressBytes"),
+  progressEta: document.querySelector("#progressEta"),
+  progressSpeed: document.querySelector("#progressSpeed"),
+  progressCurrentFile: document.querySelector("#progressCurrentFile"),
   systemLogList: document.querySelector("#systemLogList"),
   exportButton: document.querySelector("#exportButton"),
   metrics: document.querySelector("#metrics"),
@@ -183,6 +195,7 @@ async function init() {
 
 function bindEvents() {
   elements.scanButton.addEventListener("click", runScan);
+  elements.cancelScanButton?.addEventListener("click", cancelScanJob);
   elements.chooseRootButton?.addEventListener("click", chooseRootDirectory);
   elements.minimumFreeGb?.addEventListener("change", handleSpacePreferenceChange);
   elements.targetFreeGb?.addEventListener("change", handleSpacePreferenceChange);
@@ -280,16 +293,13 @@ async function runScan() {
   setStatus("escaneando", "busy");
   startScanProgress();
   resetSystemLog();
+  state.lastScanFinalReport = null;
   appendSystemLog(isNativeMaidSpace() ? "MaidSpace local iniciado." : "MaidSpace fallback iniciado.");
 
   try {
     await loadUserPreferences(rootPath, { quiet: true });
     await saveTargetPreference(targetFreeBytesFromInput(), minimumFreeBytesFromInput(), { quiet: true });
-    state.result = await fetchJson("/api/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rootPath, options })
-    });
+    state.result = await runScanJob(rootPath, options);
     if (state.result.preferences) {
       state.preferences = normalizePreferences(state.result.preferences);
       state.exemptionDraft = Object.keys(state.preferences.exemptDirectories || {});
@@ -304,18 +314,34 @@ async function runScan() {
     elements.exportButton.disabled = false;
     syncOptionsFromResult();
     setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
-    finishScanProgress("ok", state.result);
+    finishScanProgress("ok", state.result, state.lastScanFinalReport);
     updateSpaceAlert(state.result.diskStatus || state.result.disk || null);
     appendSystemLog(`Varredura concluida: ${formatNumber(state.result.summary.files || 0)} arquivos e ${formatBytes(state.result.summary.totalBytes || 0)} lidos.`);
+    appendScanFinalReport(state.lastScanFinalReport);
     renderAll();
   } catch (error) {
+    if (error?.cancelled) {
+      setStatus("cancelado", "error");
+      finishScanProgress("cancelled", null, error.finalReport);
+      appendSystemLog(errorMessage(error));
+      appendScanFinalReport(error.finalReport);
+      if (!state.result) {
+        renderError("Varredura cancelada com seguranca.");
+      }
+      return;
+    }
     const message = errorMessage(error);
     setStatus("erro na varredura", "error");
     finishScanProgress("error");
     appendSystemLog(`Erro: ${message}`);
+    appendScanFinalReport(error.finalReport);
     renderError(message);
   } finally {
     elements.scanButton.disabled = false;
+    elements.cancelScanButton.disabled = true;
+    await stopScanProgressListener();
+    state.scanAbortController = null;
+    state.scanJobId = null;
   }
 }
 
@@ -327,6 +353,294 @@ function buildDefaultScanOptions() {
     targetFreeBytes: targetFreeBytesFromInput(),
     minimumFreeBytes: minimumFreeBytesFromInput()
   };
+}
+
+async function runScanJob(rootPath, options) {
+  if (isNativeMaidSpace()) {
+    return runNativeScanJob(rootPath, options);
+  }
+  return runStreamingScanJob(rootPath, options);
+}
+
+async function runNativeScanJob(rootPath, options) {
+  const listen = window.__TAURI__?.event?.listen;
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!listen || !invoke) {
+    const scan = await fetchNative("/api/scan", {
+      method: "POST",
+      body: JSON.stringify({ rootPath, options })
+    });
+    state.lastScanFinalReport = buildClientScanFinalReport("concluido", scan, state.scanProgress);
+    return scan;
+  }
+
+  await stopScanProgressListener();
+  let acceptedJobId = null;
+
+  return await new Promise(async (resolve, reject) => {
+    let settled = false;
+    const settle = (handler, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      stopScanProgressListener();
+      handler(value);
+    };
+
+    try {
+      state.scanProgressUnlisten = await listen("scan-progress", (event) => {
+        const payload = event.payload || {};
+        if (acceptedJobId && payload.jobId && payload.jobId !== acceptedJobId) {
+          return;
+        }
+        if (payload.jobId && !acceptedJobId) {
+          acceptedJobId = payload.jobId;
+          state.scanJobId = payload.jobId;
+        }
+
+        const progress = normalizeScanProgress(payload);
+        updateScanJobProgress(progress);
+        if (payload.finalReport) {
+          state.lastScanFinalReport = payload.finalReport;
+        }
+
+        if (payload.stage === "finished") {
+          const result = nativeReportToResult(payload.result, rootPath, options);
+          state.lastScanFinalReport = payload.finalReport || buildClientScanFinalReport("concluido", result, progress);
+          settle(resolve, result);
+        } else if (payload.stage === "cancelled") {
+          settle(reject, createCancelledError(payload.finalReport));
+        } else if (payload.stage === "failed") {
+          const error = new Error(payload.error || payload.message || "Falha na varredura local.");
+          error.finalReport = payload.finalReport || null;
+          settle(reject, error);
+        }
+      });
+
+      const jobId = await invoke("start_scan_job", {
+        rootPath,
+        targetFreeBytes: options.targetFreeBytes || 0,
+        minimumFreeBytes: options.minimumFreeBytes || 0
+      });
+      acceptedJobId = jobId;
+      state.scanJobId = jobId;
+    } catch (error) {
+      settle(reject, asError(error));
+    }
+  });
+}
+
+async function runStreamingScanJob(rootPath, options) {
+  state.scanAbortController = new AbortController();
+  let latestResult = null;
+  let buffer = "";
+
+  try {
+    const response = await fetch("/api/scan-progressive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rootPath,
+        options: {
+          ...options,
+          compactFinal: false
+        }
+      }),
+      signal: state.scanAbortController.signal
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+
+    if (!response.body?.getReader) {
+      latestResult = await fetchJson("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rootPath, options })
+      });
+      state.lastScanFinalReport = buildClientScanFinalReport("concluido", latestResult, state.scanProgress);
+      return latestResult;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const event = parseScanStreamLine(line);
+        if (!event) {
+          continue;
+        }
+        const result = handleScanStreamEvent(event, latestResult);
+        if (result) {
+          latestResult = result;
+        }
+      }
+    }
+
+    if (buffer.trim()) {
+      const event = parseScanStreamLine(buffer);
+      const result = event ? handleScanStreamEvent(event, latestResult) : null;
+      if (result) {
+        latestResult = result;
+      }
+    }
+
+    if (!latestResult) {
+      throw new Error("A varredura progressiva terminou sem resultado.");
+    }
+    state.lastScanFinalReport = state.lastScanFinalReport || buildClientScanFinalReport("concluido", latestResult, state.scanProgress);
+    return latestResult;
+  } catch (error) {
+    if (error?.name === "AbortError" || state.scanCancelRequested) {
+      throw createCancelledError(buildClientScanFinalReport("cancelado", latestResult, state.scanProgress));
+    }
+    throw error;
+  } finally {
+    state.scanAbortController = null;
+  }
+}
+
+function parseScanStreamLine(line) {
+  const text = String(line || "").trim();
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function handleScanStreamEvent(event, latestResult) {
+  if (event.type === "heartbeat") {
+    updateScanJobProgress(progressFromHeartbeat(event));
+    return null;
+  }
+
+  if (event.type === "snapshot") {
+    const result = event.result || latestResult;
+    const progress = progressFromProgressive(event.progress || {}, result);
+    updateScanJobProgress(progress);
+    if (event.finalReport) {
+      state.lastScanFinalReport = event.finalReport;
+    }
+    if (event.progress?.isFinal && result) {
+      state.lastScanFinalReport = event.finalReport || buildClientScanFinalReport("concluido", result, progress);
+    }
+    return result;
+  }
+
+  if (event.type === "error") {
+    const error = new Error(event.error || "Erro na varredura progressiva.");
+    error.finalReport = event.finalReport || null;
+    throw error;
+  }
+
+  if (event.type === "done" && latestResult) {
+    state.lastScanFinalReport = event.finalReport || state.lastScanFinalReport || buildClientScanFinalReport("concluido", latestResult, state.scanProgress);
+  }
+
+  return null;
+}
+
+function progressFromHeartbeat(event) {
+  const scan = event.scan || {};
+  return {
+    stage: scan.currentPath ? "scanning" : "analyzing",
+    currentFile: scan.currentPath || state.scanProgress?.currentFile || "",
+    processedFiles: Number(scan.files || state.scanProgress?.processedFiles || 0),
+    totalFiles: 0,
+    totalKnown: false,
+    processedBytes: Number(scan.totalBytes || state.scanProgress?.processedBytes || 0),
+    totalBytes: 0,
+    elapsedSeconds: Number(event.elapsedMs || 0) / 1000,
+    warningsCount: Number(state.scanProgress?.warningsCount || 0),
+    skippedCount: Number(state.scanProgress?.skippedCount || 0),
+    errorsCount: Number(state.scanProgress?.errorsCount || 0),
+    message: event.message || "Varredura em andamento"
+  };
+}
+
+function progressFromProgressive(progress, result) {
+  const summary = result?.summary || {};
+  const currentFile = Array.isArray(progress.newNodes) && progress.newNodes.length
+    ? progress.newNodes[0]
+    : state.scanProgress?.currentFile || "";
+  const processedFiles = Number(summary.files || progress.files || state.scanProgress?.processedFiles || 0);
+  const processedBytes = Number(summary.totalBytes || progress.cumulativeBytes || state.scanProgress?.processedBytes || 0);
+  const warningsCount = Array.isArray(result?.warnings) ? result.warnings.length : Number(summary.warnings || state.scanProgress?.warningsCount || 0);
+  const skippedCount = Array.isArray(result?.skipped) ? result.skipped.length : Number(summary.skipped || state.scanProgress?.skippedCount || 0);
+  return {
+    stage: progress.isFinal ? "finished" : "analyzing",
+    currentFile,
+    processedFiles,
+    totalFiles: progress.isFinal ? processedFiles : 0,
+    totalKnown: Boolean(progress.isFinal),
+    processedBytes,
+    totalBytes: progress.isFinal ? processedBytes : 0,
+    elapsedSeconds: state.scanProgressStartedAt ? (performance.now() - state.scanProgressStartedAt) / 1000 : 0,
+    estimatedRemainingSeconds: estimateRemainingSeconds(Number(progress.percent || 0), state.scanProgressStartedAt),
+    warningsCount,
+    skippedCount,
+    errorsCount: Number(state.scanProgress?.errorsCount || 0),
+    percent: Number(progress.percent || 0),
+    message: progress.isFinal
+      ? "Varredura concluida"
+      : `Profundidade ${progress.currentDepth || "?"}/${progress.maxDepth || "?"}`
+  };
+}
+
+async function cancelScanJob() {
+  state.scanCancelRequested = true;
+  updateScanJobProgress({
+    ...(state.scanProgress || {}),
+    stage: "cancelling",
+    message: "Cancelando com seguranca"
+  });
+
+  if (elements.cancelScanButton) {
+    elements.cancelScanButton.disabled = true;
+  }
+
+  try {
+    if (isNativeMaidSpace()) {
+      await window.__TAURI__?.core?.invoke("cancel_scan_job", {
+        jobId: state.scanJobId || null
+      });
+    } else if (state.scanAbortController) {
+      state.scanAbortController.abort();
+    }
+    appendSystemLog("Cancelamento solicitado; o MaidSpace vai parar antes do proximo arquivo seguro.");
+  } catch (error) {
+    appendSystemLog(`Cancelar varredura: ${errorMessage(error)}`);
+  }
+}
+
+async function stopScanProgressListener() {
+  if (typeof state.scanProgressUnlisten === "function") {
+    state.scanProgressUnlisten();
+  }
+  state.scanProgressUnlisten = null;
+}
+
+function createCancelledError(finalReport = null) {
+  const error = new Error("Varredura cancelada com seguranca.");
+  error.cancelled = true;
+  error.finalReport = finalReport;
+  return error;
 }
 
 function syncOptionsFromResult() {
@@ -646,6 +960,12 @@ async function fetchNative(url, options = {}) {
       return await invoke("reveal_in_explorer", {
         rootPath: body.rootPath,
         relativePath: body.relativePath
+      });
+    }
+    if (url === "/api/open-path") {
+      const body = JSON.parse(options.body || "{}");
+      return await invoke("reveal_system_path", {
+        path: body.path
       });
     }
     if (url === "/api/preferences/decision") {
@@ -1352,12 +1672,20 @@ function startScanProgress() {
   }
 
   state.scanProgressStartedAt = performance.now();
-  state.scanProgressPercent = 4;
+  state.scanProgressPercent = 0;
+  state.scanProgress = null;
+  state.scanCancelRequested = false;
   elements.scanProgress.classList.remove("is-hidden");
   elements.scanProgress.dataset.mode = "busy";
-  elements.progressLabel.textContent = "Escaneando arquivos e diretorios";
+  elements.progressLabel.textContent = "Preparando varredura";
   elements.progressElapsed.textContent = "0.0s";
-  elements.progressBar.style.width = "4%";
+  elements.progressBar.style.width = "0%";
+  if (elements.progressFiles) elements.progressFiles.textContent = "0 / ?";
+  if (elements.progressBytes) elements.progressBytes.textContent = "0 B / ?";
+  if (elements.progressEta) elements.progressEta.textContent = "--";
+  if (elements.progressSpeed) elements.progressSpeed.textContent = "0 B/s";
+  if (elements.progressCurrentFile) elements.progressCurrentFile.textContent = "-";
+  if (elements.cancelScanButton) elements.cancelScanButton.disabled = false;
 
   if (state.scanProgressTimer) {
     window.clearInterval(state.scanProgressTimer);
@@ -1373,16 +1701,20 @@ function updateScanProgress() {
   }
 
   const elapsedMs = performance.now() - state.scanProgressStartedAt;
-  const nextPercent = state.scanProgressPercent + Math.max(0.18, (94 - state.scanProgressPercent) * 0.018);
-  state.scanProgressPercent = Math.min(94, nextPercent);
   elements.progressElapsed.textContent = formatElapsed(elapsedMs);
-  elements.progressBar.style.width = `${state.scanProgressPercent.toFixed(1)}%`;
-  elements.progressLabel.textContent = elapsedMs > 8000
-    ? "Analisando dependencias, uso e riscos"
-    : "Escaneando arquivos e diretorios";
+  if (state.scanProgress) {
+    const progress = {
+      ...state.scanProgress,
+      elapsedSeconds: elapsedMs / 1000
+    };
+    if (!Number.isFinite(Number(progress.estimatedRemainingSeconds))) {
+      progress.estimatedRemainingSeconds = estimateRemainingSeconds(progress.percent, state.scanProgressStartedAt);
+    }
+    updateScanJobProgress(progress, { skipElapsed: true });
+  }
 }
 
-function finishScanProgress(mode, result) {
+function finishScanProgress(mode, result, finalReport = null) {
   if (!elements.scanProgress) {
     return;
   }
@@ -1395,14 +1727,224 @@ function finishScanProgress(mode, result) {
   const elapsedMs = state.scanProgressStartedAt ? performance.now() - state.scanProgressStartedAt : 0;
   elements.scanProgress.dataset.mode = mode;
   elements.progressElapsed.textContent = formatElapsed(elapsedMs);
+  if (elements.cancelScanButton) elements.cancelScanButton.disabled = true;
 
   if (mode === "ok") {
     const summary = result?.summary || {};
     elements.progressBar.style.width = "100%";
     elements.progressLabel.textContent = `Concluido: ${formatNumber(summary.files || 0)} arquivos, ${formatNumber(summary.directories || 0)} diretorios`;
+    updateScanJobProgress({
+      ...(state.scanProgress || {}),
+      stage: "finished",
+      processedFiles: summary.files || 0,
+      totalFiles: summary.files || 0,
+      totalKnown: true,
+      processedBytes: summary.totalBytes || 0,
+      totalBytes: summary.totalBytes || 0,
+      elapsedSeconds: elapsedMs / 1000,
+      estimatedRemainingSeconds: 0,
+      message: "Concluido"
+    }, { skipElapsed: true });
+  } else if (mode === "cancelled") {
+    elements.scanProgress.dataset.mode = "cancelled";
+    elements.progressLabel.textContent = "Cancelado com seguranca";
+    if (finalReport?.processedBytes && elements.progressBytes) {
+      elements.progressBytes.textContent = `${formatBytes(finalReport.processedBytes)} / ?`;
+    }
   } else {
     elements.progressLabel.textContent = "Varredura interrompida";
   }
+}
+
+function updateScanJobProgress(progress, options = {}) {
+  if (!elements.scanProgress) {
+    return;
+  }
+
+  const normalized = normalizeScanProgress(progress);
+  state.scanProgress = normalized;
+  const percent = scanProgressPercent(normalized);
+  state.scanProgressPercent = percent;
+
+  elements.scanProgress.classList.remove("is-hidden");
+  elements.scanProgress.dataset.mode = normalized.stage === "cancelled"
+    ? "cancelled"
+    : normalized.stage === "failed"
+      ? "error"
+      : normalized.stage === "finished"
+        ? "ok"
+        : "busy";
+  elements.progressBar.style.width = `${percent.toFixed(1)}%`;
+  elements.progressLabel.textContent = normalized.message || scanStageLabel(normalized.stage);
+  if (!options.skipElapsed) {
+    elements.progressElapsed.textContent = formatDurationSeconds(normalized.elapsedSeconds);
+  }
+  if (elements.progressFiles) {
+    elements.progressFiles.textContent = progressCountText(normalized.processedFiles, normalized.totalFiles, normalized.totalKnown);
+  }
+  if (elements.progressBytes) {
+    elements.progressBytes.textContent = progressBytesText(normalized.processedBytes, normalized.totalBytes, normalized.totalKnown);
+  }
+  if (elements.progressEta) {
+    elements.progressEta.textContent = normalized.estimatedRemainingSeconds > 0
+      ? formatDurationSeconds(normalized.estimatedRemainingSeconds)
+      : normalized.stage === "finished"
+        ? "0.0s"
+        : "--";
+  }
+  if (elements.progressSpeed) {
+    elements.progressSpeed.textContent = `${formatBytes(normalized.currentSpeedBytesPerSecond || 0)}/s`;
+  }
+  if (elements.progressCurrentFile) {
+    elements.progressCurrentFile.textContent = normalized.currentFile
+      ? trimLabel(normalized.currentFile, 96)
+      : "-";
+    elements.progressCurrentFile.title = normalized.currentFile || "";
+  }
+}
+
+function normalizeScanProgress(progress = {}) {
+  const elapsedSeconds = Number(progress.elapsedSeconds ?? progress.elapsed_seconds);
+  const processedBytes = Number(progress.processedBytes ?? progress.processed_bytes ?? 0);
+  const totalBytes = Number(progress.totalBytes ?? progress.total_bytes ?? 0);
+  const speed = Number(progress.currentSpeedBytesPerSecond ?? progress.current_speed_bytes_per_second);
+  const fallbackElapsed = state.scanProgressStartedAt ? (performance.now() - state.scanProgressStartedAt) / 1000 : 0;
+  const computedSpeed = Number.isFinite(speed) && speed >= 0
+    ? speed
+    : fallbackElapsed > 0
+      ? processedBytes / fallbackElapsed
+      : 0;
+  const percent = Number(progress.percent);
+  return {
+    stage: String(progress.stage || "scanning"),
+    currentFile: String(progress.currentFile ?? progress.current_file ?? ""),
+    processedFiles: Number(progress.processedFiles ?? progress.processed_files ?? 0),
+    totalFiles: Number(progress.totalFiles ?? progress.total_files ?? 0),
+    totalKnown: progress.totalKnown !== false && progress.total_known !== false,
+    processedBytes,
+    totalBytes,
+    elapsedSeconds: Number.isFinite(elapsedSeconds) ? elapsedSeconds : fallbackElapsed,
+    estimatedRemainingSeconds: Number(progress.estimatedRemainingSeconds ?? progress.estimated_remaining_seconds),
+    currentSpeedBytesPerSecond: computedSpeed,
+    warningsCount: Number(progress.warningsCount ?? progress.warnings_count ?? 0),
+    skippedCount: Number(progress.skippedCount ?? progress.skipped_count ?? 0),
+    errorsCount: Number(progress.errorsCount ?? progress.errors_count ?? 0),
+    percent: Number.isFinite(percent) ? percent : null,
+    message: progress.message ? String(progress.message) : ""
+  };
+}
+
+function scanProgressPercent(progress) {
+  if (progress.stage === "finished") {
+    return 100;
+  }
+  if (Number.isFinite(progress.percent)) {
+    return clamp(progress.percent, progress.stage === "cancelling" ? 0 : 3, 99);
+  }
+  if (progress.totalKnown && progress.totalBytes > 0) {
+    return clamp((progress.processedBytes / progress.totalBytes) * 100, 3, 99);
+  }
+  if (progress.totalKnown && progress.totalFiles > 0) {
+    return clamp((progress.processedFiles / progress.totalFiles) * 100, 3, 99);
+  }
+  return progress.processedFiles > 0 || progress.processedBytes > 0 ? 8 : 3;
+}
+
+function progressCountText(processed, total, totalKnown) {
+  const left = formatNumber(processed || 0);
+  return totalKnown && total > 0 ? `${left} / ${formatNumber(total)}` : `${left} / ?`;
+}
+
+function progressBytesText(processed, total, totalKnown) {
+  const left = formatBytes(processed || 0);
+  return totalKnown && total > 0 ? `${left} / ${formatBytes(total)}` : `${left} / ?`;
+}
+
+function scanStageLabel(stage) {
+  const labels = {
+    planning: "Planejamento",
+    scanning: "Varrendo arquivos",
+    analyzing: "Analisando riscos",
+    moving: "Movendo arquivos",
+    deleting: "Excluindo arquivos",
+    quarantining: "Enviando para quarentena",
+    logging: "Gerando relatorio",
+    cancelling: "Cancelando com seguranca",
+    cancelled: "Cancelado",
+    failed: "Falhou",
+    finished: "Concluido"
+  };
+  return labels[stage] || "Processando";
+}
+
+function estimateRemainingSeconds(percent, startedAt) {
+  const value = Number(percent);
+  if (!startedAt || !Number.isFinite(value) || value <= 0 || value >= 100) {
+    return null;
+  }
+  const elapsedSeconds = (performance.now() - startedAt) / 1000;
+  return Math.max(0, elapsedSeconds * ((100 - value) / value));
+}
+
+function buildClientScanFinalReport(status, result, progress = {}) {
+  const summary = result?.summary || {};
+  const elapsedSeconds = Number(progress?.elapsedSeconds) || (state.scanProgressStartedAt ? (performance.now() - state.scanProgressStartedAt) / 1000 : 0);
+  const processedBytes = Number(progress?.processedBytes || summary.totalBytes || 0);
+  const filesProcessed = Number(progress?.processedFiles || summary.files || 0);
+  return {
+    status,
+    filesAnalyzed: Number(summary.analyzedFiles || summary.files || filesProcessed || 0),
+    filesProcessed,
+    filesMoved: 0,
+    filesSkipped: Number(progress?.skippedCount || summary.skipped || 0),
+    errors: Number(progress?.errorsCount || 0),
+    warnings: Number(progress?.warningsCount || summary.warnings || 0),
+    processedBytes,
+    processedHuman: formatBytes(processedBytes),
+    totalSeconds: elapsedSeconds,
+    stageTimings: progress?.stageTimings || {},
+    averageSpeedBytesPerSecond: elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0,
+    logPath: progress?.logPath || null
+  };
+}
+
+function appendScanFinalReport(report) {
+  if (!report) {
+    return;
+  }
+  appendSystemLog(`Relatorio: ${report.status}; ${formatNumber(report.filesProcessed || report.filesAnalyzed || 0)} arquivo(s), ${formatBytes(report.processedBytes || 0)}, ${formatDurationSeconds(report.totalSeconds || 0)}.`);
+  const timings = report.stageTimings || {};
+  const timingText = Object.entries(timings)
+    .filter(([key]) => key !== "total")
+    .map(([key, value]) => `${scanStageLabel(key)} ${formatDurationSeconds(Number(value || 0))}`)
+    .join("; ");
+  if (timingText) {
+    appendSystemLog(`Tempo por etapa: ${timingText}.`);
+  }
+  if (report.logPath) {
+    appendSystemLog(`Log: ${report.logPath}`);
+  }
+}
+
+function appendAlcStageTimings(timings) {
+  if (!timings || typeof timings !== "object") {
+    return;
+  }
+  const timingText = ["planning", "moving", "quarantining", "deleting", "logging"]
+    .filter((key) => Number(timings[key] || 0) > 0)
+    .map((key) => `${scanStageLabel(key)} ${formatDurationSeconds(Number(timings[key] || 0))}`)
+    .join("; ");
+  if (timingText) {
+    appendSystemLog(`A.L.C tempo por etapa: ${timingText}.`);
+  }
+}
+
+function formatDurationSeconds(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) {
+    return "--";
+  }
+  return formatElapsed(value * 1000);
 }
 
 function updateProgressiveScanProgress(progress, result) {
@@ -3314,16 +3856,16 @@ function renderAlcModal() {
       </div>
       <div class="alc-control-grid" role="radiogroup" aria-label="Destino do A.L.C">
         <label class="alc-target-card">
-          <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "delete" || (nativeExecutor && state.alcDraft.targetKind === "trash") ? "" : " checked"}>
+          <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "directory" ? " checked" : ""}>
           <span><b>Mover</b><small>preserva arquivos fora da raiz</small></span>
+        </label>
+        <label class="alc-target-card">
+          <input type="radio" name="alcTargetKind" value="quarantine"${state.alcDraft.targetKind === "quarantine" || state.alcDraft.targetKind === "delete" ? " checked" : ""}>
+          <span><b>Quarentena</b><small>padrao reversivel com manifesto</small></span>
         </label>
         <label class="alc-target-card">
           <input type="radio" name="alcTargetKind" value="trash"${nativeExecutor && state.alcDraft.targetKind === "trash" ? " checked" : ""}${nativeExecutor ? "" : " disabled"}>
           <span><b>Lixeira</b><small>${nativeExecutor ? "reversivel, nao libera tudo" : "somente app desktop"}</small></span>
-        </label>
-        <label class="alc-target-card">
-          <input type="radio" name="alcTargetKind" value="delete"${state.alcDraft.targetKind === "delete" ? " checked" : ""}>
-          <span><b>Excluir</b><small>definitivo e mais rapido</small></span>
         </label>
       </div>
       <div id="alcDestinationBlock" class="alc-destination">
@@ -3343,12 +3885,17 @@ function renderAlcModal() {
         </div>
         <span id="alcSelectedSummary" class="muted">...</span>
       </div>
+      ${renderAlcOperationPreview(filteredCandidates, visibleBytes)}
       ${renderAlcMiniExplorer(filteredCandidates, plannedBytes, totalBytes)}
       ${renderAlcCandidateTable(previewCandidates, sourceCandidates, filteredCandidates)}
       ${renderAlcProgressPanel()}
       <div id="alcResult" class="alc-result is-hidden"></div>
       <div class="alc-footer">
-        <p class="muted"></p>
+        <div class="alc-action-row">
+          <button id="openAlcManifestButton" class="ghost-button" type="button"${state.lastAlcReport?.manifestPath ? "" : " disabled"}>Abrir relatorio</button>
+          <button id="openAlcQuarantineButton" class="ghost-button" type="button"${state.lastAlcReport?.quarantineDirectory ? "" : " disabled"}>Abrir quarentena</button>
+        </div>
+        <button id="simulateAlcButton" class="ghost-button" type="button">Simular</button>
         <button id="executeAlcButton" class="primary-button" type="button">Executar</button>
       </div>
     </section>
@@ -3360,12 +3907,12 @@ function renderAlcSafetyNotice(userContentCount, candidateCount) {
     <section class="alc-safety-notice" aria-label="Avisos importantes do A.L.C">
       <div>
         <strong>Avisos importantes</strong>
-        <p>Arquivos temporarios, caches, logs, instaladores, compactados antigos, downloads e itens de baixo uso podem ser movidos, enviados para a lixeira ou excluidos quando voce confirmar.</p>
+        <p>Arquivos temporarios, caches, logs, instaladores, compactados antigos, downloads e itens de baixo uso podem ser movidos, quarentenados ou enviados para a lixeira quando voce confirmar.</p>
       </div>
       <ul>
         <li>Revise documentos, fotos, videos, projetos, saves, backups e qualquer pasta sincronizada antes de executar.</li>
         <li>E recomendado isentar pastas de trabalho, clientes, estudos, repositorios ativos, nuvem e qualquer diretorio que voce nao quer tocar.</li>
-        <li>Para liberar espaco rapido de verdade, use Excluir; Lixeira ainda ocupa espaco no disco ate ser esvaziada.</li>
+        <li>Quarentena preserva caminho original no manifesto; exclusao permanente nao e o padrao desta tela.</li>
         <li>Garantia operacional: o A.L.C nao age sozinho; ele respeita isencoes, mostra a fila e so executa depois da sua confirmacao.</li>
       </ul>
       <small>${formatNumber(candidateCount)} candidato(s) na fila atual; ${formatNumber(userContentCount)} parecem conteudo do usuario.</small>
@@ -3492,6 +4039,60 @@ function alcModeFileCount(modeData = {}) {
     Number(modeData.detailedFileCount || 0),
     Number(modeData.fileCount || 0)
   );
+}
+
+function renderAlcOperationPreview(candidates, visibleBytes) {
+  const groups = new Map();
+  for (const item of candidates) {
+    const key = (item.spatialCategories && item.spatialCategories[0])
+      || item.cleanupMode
+      || item.deletionDecision
+      || "revisao";
+    const group = groups.get(key) || { key, files: 0, bytes: 0 };
+    group.files += 1;
+    group.bytes += candidateBytes(item);
+    groups.set(key, group);
+  }
+  const topGroups = Array.from(groups.values())
+    .sort((a, b) => b.bytes - a.bytes || b.files - a.files)
+    .slice(0, 8);
+  const largest = candidates
+    .slice()
+    .sort((a, b) => candidateBytes(b) - candidateBytes(a))
+    .slice(0, 6);
+
+  return `
+    <section class="alc-preview-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Previa operacional</h3>
+        </div>
+      </div>
+      <div class="alc-summary">
+        <span><strong>${formatBytes(visibleBytes)}</strong> afetado</span>
+        <span><strong>${formatNumber(candidates.length)}</strong> arquivo(s)</span>
+        <span><strong>${formatNumber(topGroups.length)}</strong> grupo(s)</span>
+      </div>
+      <div class="alc-preview-columns">
+        <div>
+          <strong>Grupos</strong>
+          <ul class="compact-list">
+            ${topGroups.length ? topGroups.map((group) => `
+              <li><span>${escapeHtml(group.key)}</span><small>${formatNumber(group.files)} / ${formatBytes(group.bytes)}</small></li>
+            `).join("") : `<li><span>Nenhum grupo.</span></li>`}
+          </ul>
+        </div>
+        <div>
+          <strong>Maiores itens</strong>
+          <ul class="compact-list">
+            ${largest.length ? largest.map((item) => `
+              <li><span>${escapeHtml(item.path)}</span><small>${formatBytes(candidateBytes(item))}</small></li>
+            `).join("") : `<li><span>Nenhum item.</span></li>`}
+          </ul>
+        </div>
+      </div>
+    </section>
+  `;
 }
 
 function renderAlcMiniExplorer(candidates, plannedBytes, previewBytes) {
@@ -3623,6 +4224,8 @@ function renderAlcProgressPanel() {
     ? "Cancelado"
     : progress?.phase === "done"
     ? "Pronto"
+    : progress?.phase === "dry-run"
+    ? "Simulando"
     : progress
     ? "Movendo"
     : "Pronto";
@@ -3664,6 +4267,8 @@ function updateAlcProgressPanel() {
       ? "Cancelado"
       : progress.phase === "done"
       ? "Pronto"
+      : progress.phase === "dry-run"
+      ? "Simulando"
       : state.alcCancelRequested
       ? "Parando"
       : "Movendo";
@@ -3725,6 +4330,21 @@ async function cancelAlcRelocation() {
   }
 }
 
+async function openLocalPath(targetPath) {
+  if (!targetPath) {
+    return;
+  }
+  try {
+    await fetchJson("/api/open-path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: targetPath })
+    });
+  } catch (error) {
+    appendSystemLog(`Abrir caminho: ${errorMessage(error)}`);
+  }
+}
+
 function wireAlcModalControls() {
   const body = elements.alcModalBody;
   if (!body) {
@@ -3734,6 +4354,7 @@ function wireAlcModalControls() {
   const destinationInput = body.querySelector("#alcDestinationPath");
   const executeBody = elements.alcModalBody || body;
   const executeButton = executeBody.querySelector("#executeAlcButton");
+  const simulateButton = executeBody.querySelector("#simulateAlcButton");
   const cancelButton = executeBody.querySelector("#cancelAlcButton");
   const destinationBlock = body.querySelector("#alcDestinationBlock");
   const summary = body.querySelector("#alcSelectedSummary");
@@ -3756,6 +4377,9 @@ function wireAlcModalControls() {
     }
     if (executeButton) {
       executeButton.disabled = (!selected.length && !canExecutePlan) || !hasDestination;
+    }
+    if (simulateButton) {
+      simulateButton.disabled = (!selected.length && !canExecutePlan) || !hasDestination;
     }
   };
 
@@ -3898,7 +4522,10 @@ function wireAlcModalControls() {
     }
   });
   cancelButton?.addEventListener("click", cancelAlcRelocation);
+  simulateButton?.addEventListener("click", () => runAlcRelocation({ dryRun: true }));
   executeButton?.addEventListener("click", executeAlcRelocation);
+  body.querySelector("#openAlcManifestButton")?.addEventListener("click", () => openLocalPath(state.lastAlcReport?.finalManifestPath || state.lastAlcReport?.manifestPath));
+  body.querySelector("#openAlcQuarantineButton")?.addEventListener("click", () => openLocalPath(state.lastAlcReport?.quarantineDirectory));
   update();
   updateAlcProgressPanel();
 }
@@ -4082,7 +4709,7 @@ function preferenceDecisionForCandidate(item) {
 }
 
 function candidateNeedsUserApproval(item) {
-  return item?.risk === "alto" || item?.risk === "critico";
+  return item?.risk === "alto" || item?.risk === "critico" || isLikelyUserContentCandidate(item);
 }
 
 function shouldCandidateBePreselected(item) {
@@ -4208,6 +4835,10 @@ function selectedAlcCandidates() {
 }
 
 async function executeAlcRelocation() {
+  return runAlcRelocation({ dryRun: false });
+}
+
+async function runAlcRelocation({ dryRun = false } = {}) {
   const body = elements.alcModalBody;
   if (!body) {
     return;
@@ -4253,8 +4884,15 @@ async function executeAlcRelocation() {
     return;
   }
 
+  if (executeByPlan && !dryRun) {
+    showAlcResult(null, new Error("Expanda ou simule a fila antes de executar. A execucao real exige uma lista auditavel no manifesto."));
+    return;
+  }
+
   const actionLabel = targetKind === "delete"
     ? "excluir definitivamente"
+    : targetKind === "quarantine"
+      ? "mover para a quarentena"
     : targetKind === "trash"
       ? "enviar para a lixeira"
       : "mover para o destino";
@@ -4275,19 +4913,21 @@ async function executeAlcRelocation() {
   const planWarning = executeByPlan
     ? `\n\nO A.L.C vai expandir o plano ${modeLabel(planMode)} no nativo ate aproximadamente ${formatBytes(planTargetBytes)}. A lista visivel e apenas a previa.`
     : "";
-  const confirmed = window.confirm(`${importantTypesWarning}\n\nConfirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
-  if (!confirmed) {
-    return;
+  if (!dryRun) {
+    const confirmed = window.confirm(`${importantTypesWarning}\n\nConfirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
+    if (!confirmed) {
+      return;
+    }
   }
 
   const executeButton = body.querySelector("#executeAlcButton");
   if (executeButton) {
     executeButton.disabled = true;
-    executeButton.textContent = targetKind === "delete" ? "Excluindo" : targetKind === "trash" ? "Enviando" : "Movendo";
+    executeButton.textContent = dryRun ? "Simulando" : targetKind === "delete" ? "Excluindo" : targetKind === "trash" ? "Enviando" : "Movendo";
   }
   state.alcCancelRequested = false;
   state.alcProgress = normalizeAlcProgress({
-    phase: "start",
+    phase: dryRun ? "dry-run" : "start",
     percent: 0,
     currentFile: "",
     movedBytes: 0,
@@ -4303,12 +4943,18 @@ async function executeAlcRelocation() {
       targetKind,
       targetDirectory,
       planMode,
-      targetBytes: executeByPlan ? planTargetBytes : selectedBytes,
-      expandPlan: executeByPlan,
+      targetBytes: selectedBytes,
+      expandPlan: false,
+      dryRun,
       files: candidates.map((item) => ({
         relativePath: item.path,
         size: candidateBytes(item),
-        userContent: isLikelyUserContentCandidate(item)
+        userContent: isLikelyUserContentCandidate(item),
+        risk: item.risk,
+        reason: item.justification || item.reason,
+        deletionDecision: item.deletionDecision,
+        plannedDestination: item.targetDirectory,
+        manualApproval: preferenceDecisionForCandidate(item) === "relocate"
       }))
     };
     const report = await fetchJson("/api/alc/relocate", {
@@ -4320,7 +4966,7 @@ async function executeAlcRelocation() {
     state.alcProgress = normalizeAlcProgress({
       phase: report.cancelled ? "cancelled" : "done",
       percent: report.cancelled ? state.alcProgress?.percent || 0 : 100,
-      movedBytes: report.movedBytes || 0,
+      movedBytes: report.movedBytes || report.plannedBytes || 0,
       targetBytes: confirmationBytes,
       movedFiles: report.movedFiles || 0,
       failedFiles: report.failedFiles || 0,
@@ -4329,9 +4975,12 @@ async function executeAlcRelocation() {
       cancelled: Boolean(report.cancelled)
     });
     updateAlcProgressPanel();
-    appendSystemLog(`A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
+    appendSystemLog(dryRun
+      ? `A.L.C simulado: ${formatNumber(report.plannedFiles || report.operations?.length || 0)} item(ns), manifesto ${report.manifestPath || "gerado"}.`
+      : `A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
+    appendAlcStageTimings(report.stageTimings);
     showAlcResult(report);
-    executionCompleted = !report.cancelled;
+    executionCompleted = !dryRun && !report.cancelled;
   } catch (error) {
     appendSystemLog(`Erro A.L.C: ${errorMessage(error)}`);
     showAlcResult(null, error);
@@ -4370,9 +5019,21 @@ function showAlcResult(report, error = null) {
     return;
   }
 
+  if (report.dryRun) {
+    result.innerHTML = `
+      <strong>Simulacao gerada</strong>
+      <span>${formatNumber(report.plannedFiles || 0)} item(ns), ${formatBytes(report.plannedBytes || 0)} planejados. Nada foi movido ou apagado.</span>
+      <span>Manifesto: ${escapeHtml(report.finalManifestPath || report.manifestPath || "-")}</span>
+    `;
+    refreshAlcReportButtons();
+    return;
+  }
+
   const actionLabel = alcReportActionLabel(report);
   const spaceLabel = report.targetKind === "delete"
     ? "liberados do disco"
+    : report.effectiveAction === "quarantine" || report.targetKind === "quarantine"
+      ? "movidos para a quarentena"
     : report.targetKind === "trash"
       ? "enviados para a lixeira"
       : "retirados da raiz";
@@ -4381,16 +5042,35 @@ function showAlcResult(report, error = null) {
     <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${actionLabel}, ${formatBytes(report.movedBytes || 0)} ${spaceLabel}.</span>
     <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o A.D.D/A.R.E.</span>
   `;
+  refreshAlcReportButtons();
 }
 
 function alcReportActionLabel(report) {
   if (report?.targetKind === "delete") {
-    return "excluidos definitivamente";
+    return report?.effectiveAction === "delete_permanent" ? "excluidos definitivamente" : "quarentenados";
+  }
+  if (report?.targetKind === "quarantine" || report?.effectiveAction === "quarantine") {
+    return "quarentenados";
   }
   if (report?.targetKind === "trash") {
     return "enviados para a lixeira";
   }
   return "realocados";
+}
+
+function refreshAlcReportButtons() {
+  const body = elements.alcModalBody;
+  if (!body) {
+    return;
+  }
+  const reportButton = body.querySelector("#openAlcManifestButton");
+  const quarantineButton = body.querySelector("#openAlcQuarantineButton");
+  if (reportButton) {
+    reportButton.disabled = !state.lastAlcReport?.manifestPath && !state.lastAlcReport?.finalManifestPath;
+  }
+  if (quarantineButton) {
+    quarantineButton.disabled = !state.lastAlcReport?.quarantineDirectory;
+  }
 }
 
 function candidateBytes(item) {

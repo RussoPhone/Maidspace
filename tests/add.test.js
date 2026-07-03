@@ -6,7 +6,19 @@ const path = require("node:path");
 const { analyzeDirectory } = require("../src/add/analyzer");
 const { generateRelocationPlan } = require("../src/are/planner");
 const { applyPreferencesToAddReport } = require("../src/alc/preferences");
+const {
+  buildOperationItem,
+  createOperationManifest,
+  isProtectedPath,
+  recordOperationResult
+} = require("../src/alc/operationManifest");
 const { createAppServer, runSrcPipeline, runSrcPipelineProgressive } = require("../server");
+
+const testDataDir = path.join(os.tmpdir(), `maidspace-test-data-${process.pid}`);
+process.env.MAIDSPACE_DATA_DIR = testDataDir;
+test.after(async () => {
+  await fs.rm(testDataDir, { recursive: true, force: true });
+});
 
 test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-"));
@@ -301,6 +313,53 @@ test("Varredura progressiva atualiza A.D.D e A.R.E por profundidade", async () =
   assert.equal(snapshots.at(-1).progressive.isFinal, true);
 });
 
+test("Fallback progressivo HTTP emite relatorio final com tempos", async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-progressive-http-"));
+  const root = path.join(base, "root");
+  const server = createAppServer();
+
+  try {
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "old.tmp"), "temporario\n");
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/scan-progressive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rootPath: root,
+        options: {
+          scanEngine: "node",
+          dependencyMode: "metadata",
+          adaptive: false,
+          maxFiles: 100,
+          maxDepth: 2,
+          compactFinal: false,
+          saveState: false
+        }
+      })
+    });
+
+    assert.equal(response.ok, true);
+    const events = (await response.text())
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const report = events.find((event) => event.finalReport)?.finalReport;
+
+    assert.equal(report.status, "concluido");
+    assert.ok(report.stageTimings);
+    assert.ok(report.stageTimings.analyzing >= 0);
+    assert.ok(report.stageTimings.logging >= 0);
+    assert.ok(report.logPath);
+    await fs.access(report.logPath);
+  } finally {
+    server.close();
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
 test("A.D.D permite alternar leitura de Program Files", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-program-files-"));
   await fs.mkdir(path.join(root, "Program Files", "Tool", "downloads"), { recursive: true });
@@ -589,7 +648,78 @@ test("Varredura turbo inventaria metadados sem bloquear no grafo profundo", asyn
   assert.ok(result.relocationPlan.summary.reallocatable.alto >= 32 * 1024);
 });
 
-test("A.L.C fallback move e exclui arquivos via HTTP", async () => {
+test("A.L.C gera manifesto, dry-run e bloqueia caminho protegido", () => {
+  assert.equal(isProtectedPath("Windows/System32/kernel32.dll"), true);
+  assert.equal(isProtectedPath("Users/me/Documents/tese.pdf"), true);
+  assert.equal(isProtectedPath("Users/me/Documents/tese.pdf", { manualApproval: true }), false);
+
+  const item = buildOperationItem({
+    relativePath: "cache/old.tmp",
+    size: 1024,
+    risk: "baixo",
+    reason: "cache antigo"
+  }, {
+    rootPath: "C:/root",
+    targetKind: "delete",
+    quarantineDirectory: "C:/MaidSpace/quarantine/op-1"
+  });
+  assert.equal(item.action, "quarantine");
+  assert.match(item.plannedDestination, /quarantine/);
+
+  const manifest = createOperationManifest({
+    operationId: "op-test",
+    dryRun: true,
+    rootPath: "C:/root",
+    targetKind: "delete",
+    quarantineDirectory: "C:/MaidSpace/quarantine/op-test",
+    files: [item]
+  });
+  assert.equal(manifest.mode, "dry-run");
+  assert.equal(manifest.totalFiles, 1);
+  assert.equal(manifest.totalBytes, 1024);
+  recordOperationResult(manifest, item.id, { status: "success", finalPath: "C:/dest/cache/old.tmp" });
+  assert.equal(manifest.items[0].status, "success");
+});
+
+test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-alc-dry-"));
+  const root = path.join(base, "root");
+  const server = createAppServer();
+
+  try {
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "cache.tmp"), "cache");
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/relocate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request: {
+          rootPath: root,
+          targetKind: "quarantine",
+          dryRun: true,
+          files: [{ relativePath: "cache.tmp", size: 5, risk: "baixo", reason: "teste" }]
+        }
+      })
+    });
+    const payload = await response.json();
+    assert.equal(response.ok, true, payload.error || "falha HTTP");
+    assert.equal(payload.dryRun, true);
+    assert.equal(payload.plannedFiles, 1);
+    assert.equal(payload.movedFiles, 0);
+    assert.ok(payload.manifestPath);
+    assert.ok(payload.stageTimings);
+    assert.ok(payload.stageTimings.planning >= 0);
+    assert.ok(payload.stageTimings.logging >= 0);
+    await fs.access(path.join(root, "cache.tmp"));
+  } finally {
+    server.close();
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
+test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-alc-http-"));
   const root = path.join(base, "root");
   const destination = path.join(base, "dest");
@@ -599,7 +729,7 @@ test("A.L.C fallback move e exclui arquivos via HTTP", async () => {
     await fs.mkdir(root, { recursive: true });
     await fs.mkdir(destination, { recursive: true });
     await fs.writeFile(path.join(root, "move-me.txt"), "move");
-    await fs.writeFile(path.join(root, "delete-me.txt"), "delete");
+    await fs.writeFile(path.join(root, "delete-me.tmp"), "delete");
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 
     const postRelocate = async (request) => {
@@ -620,16 +750,20 @@ test("A.L.C fallback move e exclui arquivos via HTTP", async () => {
       files: [{ relativePath: "move-me.txt" }]
     });
     assert.equal(moveReport.movedFiles, 1);
+    assert.ok(moveReport.stageTimings.moving >= 0);
     await assert.rejects(fs.access(path.join(root, "move-me.txt")));
     await fs.access(path.join(destination, "move-me.txt"));
 
     const deleteReport = await postRelocate({
       rootPath: root,
       targetKind: "delete",
-      files: [{ relativePath: "delete-me.txt" }]
+      files: [{ relativePath: "delete-me.tmp" }]
     });
     assert.equal(deleteReport.movedFiles, 1);
-    await assert.rejects(fs.access(path.join(root, "delete-me.txt")));
+    assert.equal(deleteReport.effectiveAction, "quarantine");
+    assert.ok(deleteReport.stageTimings.quarantining >= 0);
+    await assert.rejects(fs.access(path.join(root, "delete-me.tmp")));
+    await fs.access(path.join(deleteReport.quarantineDirectory, "files", "delete-me.tmp"));
 
     await fs.writeFile(path.join(root, "expand-me.tmp"), "expand");
     const expandReport = await postRelocate({
@@ -641,7 +775,9 @@ test("A.L.C fallback move e exclui arquivos via HTTP", async () => {
       files: []
     });
     assert.equal(expandReport.movedFiles, 1);
+    assert.equal(expandReport.effectiveAction, "quarantine");
     await assert.rejects(fs.access(path.join(root, "expand-me.tmp")));
+    await fs.access(path.join(expandReport.quarantineDirectory, "files", "expand-me.tmp"));
   } finally {
     server.close();
     await fs.rm(base, { recursive: true, force: true });

@@ -230,11 +230,21 @@ button:disabled {
   background: var(--accent-dark);
 }
 
+.scan-actions {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.scan-actions .ghost-button {
+  min-width: 92px;
+}
+
 .scan-progress {
   background: #f7fafb;
   border: 1px solid var(--line-strong);
   display: grid;
-  gap: 7px;
+  gap: 9px;
   padding: 9px 10px;
 }
 
@@ -281,6 +291,54 @@ button:disabled {
   background: var(--high);
 }
 
+.scan-progress[data-mode="cancelled"] .progress-fill {
+  background: var(--medium);
+}
+
+.progress-metrics {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.progress-metrics span {
+  background: #fff;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 7px;
+}
+
+.progress-metrics b {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-metrics small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.progress-current-file {
+  background: #eef4f5;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+  padding: 6px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .system-log {
   background: #20272b;
   color: #dfe8ea;
@@ -291,9 +349,11 @@ button:disabled {
   padding: 9px 10px;
 }
 
-.system-log strong {
+.system-log summary {
   color: #fff;
+  cursor: pointer;
   font-size: 12px;
+  font-weight: 800;
   line-height: 1.2;
 }
 
@@ -1265,6 +1325,44 @@ summary {
   display: grid;
   gap: 6px;
   padding: 10px 12px;
+}
+
+.alc-preview-board {
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.alc-preview-columns {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.compact-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.compact-list li {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 6px 0;
+}
+
+.compact-list span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.compact-list small {
+  color: var(--muted);
+  flex: 0 0 auto;
 }
 
 .alc-progress {

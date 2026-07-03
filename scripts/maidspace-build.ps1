@@ -5,4 +5,4 @@ if (Test-Path $cargoBin) {
   $env:PATH = "$cargoBin;$env:PATH"
 }
 
-npm run maidspace:build
+cmd /c scripts\with-vsdev.cmd npm run maidspace:build

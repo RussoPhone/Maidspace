@@ -1,4 +1,5 @@
 const http = require("node:http");
+const childProcess = require("node:child_process");
 const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const path = require("node:path");
@@ -25,6 +26,17 @@ const {
 } = require("./src/alc/preferences");
 const { scanRelocationCandidates } = require("./src/scan/fastInventory");
 const { generateSrcReport } = require("./src/report");
+const {
+  buildOperationItem,
+  createOperationId,
+  createOperationManifest,
+  effectiveActionForTargetKind,
+  operationLogDirectory,
+  protectedPathReason,
+  quarantineDirectoryFor,
+  recordOperationResult,
+  writeOperationManifest
+} = require("./src/alc/operationManifest");
 
 const rootDirectory = __dirname;
 const publicDirectory = path.join(rootDirectory, "public");
@@ -122,6 +134,16 @@ function createAppServer() {
         const body = await readJsonBody(request, { limitBytes: 64 * 1024 * 1024 });
         const report = await executeAlcRelocationServer(body.request || {});
         return sendJson(response, 200, report);
+      }
+
+      if (request.method === "POST" && request.url === "/api/alc/cancel") {
+        return sendJson(response, 200, { ok: true, unsupported: true });
+      }
+
+      if (request.method === "POST" && request.url === "/api/open-path") {
+        const body = await readJsonBody(request);
+        await openSystemPath(body.path);
+        return sendJson(response, 200, { ok: true });
       }
 
       if (request.method !== "GET") {
@@ -225,6 +247,8 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
 }
 
 async function executeAlcRelocationServer(request = {}) {
+  const operationStartedAt = Date.now();
+  const planningStartedAt = Date.now();
   const rootPath = request.rootPath || defaultRootPath();
   const root = await realpathOrResolve(rootPath);
   const rootStats = await fs.stat(root);
@@ -232,55 +256,62 @@ async function executeAlcRelocationServer(request = {}) {
     throw new Error(`A raiz nao e um diretorio: ${root}`);
   }
 
-  const targetKind = String(request.targetKind || "directory").trim().toLowerCase();
-  if (!["directory", "trash", "delete"].includes(targetKind)) {
+  const dryRun = request.dryRun === true;
+  const allowPermanentDelete = request.allowPermanentDelete === true;
+  let targetKind = String(request.targetKind || "directory").trim().toLowerCase();
+  if (!["directory", "trash", "delete", "quarantine"].includes(targetKind)) {
     throw new Error("Destino A.L.C invalido.");
   }
   if (targetKind === "trash") {
-    throw new Error("Lixeira esta disponivel apenas no app desktop nativo. Use Excluir para liberar espaco ou Mover para preservar os arquivos.");
+    targetKind = "quarantine";
   }
 
+  const operationId = createOperationId();
+  const quarantineDirectory = quarantineDirectoryFor(operationId);
+  const effectiveAction = effectiveActionForTargetKind(targetKind, { allowPermanentDelete });
   const targetDirectory = targetKind === "directory"
     ? await prepareAlcTargetDirectory(request.targetDirectory, root)
+    : effectiveAction === "quarantine"
+    ? path.join(quarantineDirectory, "files")
     : null;
 
-  const files = Array.isArray(request.files) ? request.files : [];
+  const files = Array.isArray(request.files) ? [...request.files] : [];
   const report = {
     targetKind,
+    effectiveAction,
+    dryRun,
     targetDirectory,
+    quarantineDirectory: effectiveAction === "quarantine" ? quarantineDirectory : null,
+    manifestPath: null,
+    finalManifestPath: null,
     requestedFiles: 0,
+    plannedFiles: 0,
     movedFiles: 0,
     failedFiles: 0,
     skippedFiles: 0,
     cancelledFiles: 0,
     cancelled: false,
+    plannedBytes: 0,
     movedBytes: 0,
-    operations: []
+    stageTimings: {},
+    operations: [],
+    progress: {
+      currentFile: null,
+      completedFiles: 0,
+      errorFiles: 0,
+      skippedFiles: 0,
+      completedBytes: 0
+    }
   };
   const seen = new Set();
   const createdDirectories = new Set();
   const targetBytes = Math.max(0, Number(request.targetBytes || 0));
-  const executeFile = async (file) => {
-    const prepared = await prepareAlcFileServer(root, file, report, seen);
-    if (!prepared) {
-      return;
-    }
-    if (targetKind === "delete") {
-      await deletePreparedFileServer(prepared, report);
-    } else {
-      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories);
-    }
-  };
-
-  for (const file of files) {
-    await executeFile(file);
-  }
 
   if (request.expandPlan && targetBytes > 0 && report.movedBytes < targetBytes) {
     const preferences = await loadRootPreferences(rootPath);
     const expansion = await scanRelocationCandidates(root, {
       mode: request.planMode || "alto",
-      targetBytes: targetBytes - report.movedBytes,
+      targetBytes,
       limit: request.limit || 1000000,
       preferences,
       options: {
@@ -290,18 +321,114 @@ async function executeAlcRelocationServer(request = {}) {
       skipDirectories: DEFAULT_OPTIONS.skipDirectories || []
     });
     for (const candidate of expansion.candidates || []) {
-      if (report.movedBytes >= targetBytes) {
-        break;
-      }
-      await executeFile({
+      files.push({
         relativePath: candidate.path,
         size: candidateBytesServer(candidate),
-        userContent: candidate.userImpact === "alto" || candidate.userImpact === "medio"
+        userContent: candidate.userImpact === "alto" || candidate.userImpact === "medio",
+        risk: candidate.risk,
+        reason: candidate.justification,
+        deletionDecision: candidate.deletionDecision
       });
     }
   }
 
+  const preparedFiles = [];
+  for (const file of files) {
+    const prepared = await prepareAlcFileServer(root, file, report, seen, {
+      rootPath: root,
+      targetKind,
+      targetDirectory,
+      quarantineDirectory,
+      allowPermanentDelete
+    });
+    if (prepared) {
+      preparedFiles.push(prepared);
+      report.plannedFiles += 1;
+      report.plannedBytes += prepared.operation.sizeBytes;
+    }
+  }
+
+  const plannedOperations = preparedFiles.map((prepared) => ({
+    ...prepared.operation,
+    status: "planned"
+  }));
+  const manifest = createOperationManifest({
+    operationId,
+    dryRun,
+    rootPath: root,
+    targetKind,
+    targetDirectory,
+    quarantineDirectory,
+    allowPermanentDelete,
+    items: [
+      ...report.operations.map(serverOperationToManifestItem),
+      ...plannedOperations.map(serverOperationToManifestItem)
+    ]
+  });
+  report.manifestPath = await writeOperationManifest(manifest);
+  const planningSeconds = secondsSince(planningStartedAt);
+
+  if (dryRun) {
+    for (const operation of plannedOperations) {
+      pushServerOperation(report, operation);
+    }
+    const loggingStartedAt = Date.now();
+    report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
+    report.stageTimings = buildAlcStageTimings({
+      planningSeconds,
+      executionSeconds: 0,
+      loggingSeconds: secondsSince(loggingStartedAt),
+      totalSeconds: secondsSince(operationStartedAt),
+      effectiveAction,
+      dryRun
+    });
+    return report;
+  }
+
+  const executionStartedAt = Date.now();
+  for (const prepared of preparedFiles) {
+    report.progress.currentFile = prepared.operation.relativePath;
+    if (effectiveAction === "delete_permanent") {
+      await deletePreparedFileServer(prepared, report, manifest);
+    } else if (effectiveAction === "quarantine") {
+      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, "quarantined");
+    } else {
+      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, effectiveAction === "trash" ? "trashed" : "moved");
+    }
+    report.progress.completedFiles = report.movedFiles;
+    report.progress.errorFiles = report.failedFiles;
+    report.progress.skippedFiles = report.skippedFiles;
+    report.progress.completedBytes = report.movedBytes;
+  }
+  const executionSeconds = secondsSince(executionStartedAt);
+
+  manifest.status = report.failedFiles > 0 ? "completed_with_errors" : "completed";
+  const loggingStartedAt = Date.now();
+  report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
+  report.stageTimings = buildAlcStageTimings({
+    planningSeconds,
+    executionSeconds,
+    loggingSeconds: secondsSince(loggingStartedAt),
+    totalSeconds: secondsSince(operationStartedAt),
+    effectiveAction,
+    dryRun
+  });
   return report;
+}
+
+function secondsSince(startedAt) {
+  return Math.max(0, (Date.now() - Number(startedAt || Date.now())) / 1000);
+}
+
+function buildAlcStageTimings({ planningSeconds, executionSeconds, loggingSeconds, totalSeconds, effectiveAction, dryRun }) {
+  return {
+    planning: planningSeconds,
+    moving: !dryRun && effectiveAction !== "quarantine" && effectiveAction !== "delete_permanent" ? executionSeconds : 0,
+    deleting: !dryRun && effectiveAction === "delete_permanent" ? executionSeconds : 0,
+    quarantining: !dryRun && effectiveAction === "quarantine" ? executionSeconds : 0,
+    logging: loggingSeconds,
+    total: totalSeconds
+  };
 }
 
 async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
@@ -317,16 +444,34 @@ async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
   return target;
 }
 
-async function prepareAlcFileServer(root, file = {}, report, seen) {
+async function prepareAlcFileServer(root, file = {}, report, seen, context = {}) {
   const relativePath = String(file.relativePath || file.path || "");
+  const manifestItem = buildOperationItem(file, {
+    ...context,
+    rootPath: root
+  });
   const operation = {
+    id: manifestItem.id,
     relativePath,
+    originalPath: manifestItem.originalPath,
     sizeBytes: Number(file.size || file.sizeBytes || 0),
-    status: "failed",
+    status: "error",
+    action: manifestItem.action,
+    reason: manifestItem.reason,
+    risk: manifestItem.risk,
+    plannedDestination: manifestItem.plannedDestination,
     targetPath: null,
     userContent: Boolean(file.userContent),
     error: null
   };
+
+  if (manifestItem.status === "skipped") {
+    operation.status = "skipped";
+    operation.error = manifestItem.error;
+    report.skippedFiles += 1;
+    pushServerOperation(report, operation);
+    return null;
+  }
 
   let relative;
   try {
@@ -377,6 +522,15 @@ async function prepareAlcFileServer(root, file = {}, report, seen) {
   }
 
   operation.sizeBytes = stats.size;
+  operation.originalPath = sourceReal;
+  operation.plannedDestination = buildOperationItem({
+    ...file,
+    relativePath: relative,
+    size: stats.size
+  }, {
+    ...context,
+    rootPath: root
+  }).plannedDestination;
   return {
     source: sourceReal,
     relative,
@@ -384,7 +538,7 @@ async function prepareAlcFileServer(root, file = {}, report, seen) {
   };
 }
 
-async function movePreparedFileServer(prepared, targetDirectory, report, createdDirectories) {
+async function movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, successStatus = "moved") {
   const destination = uniqueDestinationServer(path.join(targetDirectory, prepared.relative));
   const parent = path.dirname(destination);
   try {
@@ -393,29 +547,47 @@ async function movePreparedFileServer(prepared, targetDirectory, report, created
       createdDirectories.add(parent);
     }
     await moveFileServer(prepared.source, destination);
-    prepared.operation.status = "moved";
+    prepared.operation.status = "success";
+    prepared.operation.action = successStatus;
     prepared.operation.targetPath = destination;
     report.movedFiles += 1;
     report.movedBytes += prepared.operation.sizeBytes;
+    recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+      status: "success",
+      finalPath: destination
+    });
   } catch (error) {
-    prepared.operation.status = "failed";
+    prepared.operation.status = "error";
     prepared.operation.error = error.message;
     report.failedFiles += 1;
+    recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+      status: "error",
+      error: error.message
+    });
   }
   pushServerOperation(report, prepared.operation);
 }
 
-async function deletePreparedFileServer(prepared, report) {
+async function deletePreparedFileServer(prepared, report, manifest) {
   try {
     await fs.rm(prepared.source, { force: true });
-    prepared.operation.status = "deleted";
+    prepared.operation.status = "success";
+    prepared.operation.action = "delete_permanent";
     prepared.operation.targetPath = "excluido";
     report.movedFiles += 1;
     report.movedBytes += prepared.operation.sizeBytes;
+    recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+      status: "success",
+      finalPath: "excluido"
+    });
   } catch (error) {
-    prepared.operation.status = "failed";
+    prepared.operation.status = "error";
     prepared.operation.error = error.message;
     report.failedFiles += 1;
+    recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+      status: "error",
+      error: error.message
+    });
   }
   pushServerOperation(report, prepared.operation);
 }
@@ -491,6 +663,52 @@ function pushServerOperation(report, operation) {
   }
 }
 
+function serverOperationToManifestItem(operation = {}) {
+  return {
+    id: operation.id || normalizeServerPath(operation.relativePath),
+    originalPath: operation.originalPath || operation.relativePath || "",
+    relativePath: operation.relativePath || "",
+    sizeBytes: Number(operation.sizeBytes || 0),
+    action: operation.action || operation.proposedAction || "move",
+    proposedAction: operation.action || operation.proposedAction || "move",
+    reason: operation.reason || operation.error || "selecionado pelo A.L.C",
+    risk: operation.risk || null,
+    plannedDestination: operation.plannedDestination || null,
+    status: normalizeManifestStatus(operation.status),
+    error: operation.error || null,
+    finalPath: operation.targetPath || null
+  };
+}
+
+function normalizeManifestStatus(status) {
+  if (status === "failed") {
+    return "error";
+  }
+  if (status === "moved" || status === "deleted" || status === "trashed" || status === "quarantined") {
+    return "success";
+  }
+  return status || "planned";
+}
+
+async function openSystemPath(rawPath) {
+  const target = String(rawPath || "").trim();
+  if (!target) {
+    throw new Error("Caminho vazio.");
+  }
+  const resolved = path.resolve(target);
+  const exists = fsSync.existsSync(resolved);
+  const openTarget = exists ? resolved : path.dirname(resolved);
+  if (process.platform === "win32") {
+    childProcess.spawn("explorer", [openTarget], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return;
+  }
+  if (process.platform === "darwin") {
+    childProcess.spawn("open", [openTarget], { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
+  childProcess.spawn("xdg-open", [openTarget], { detached: true, stdio: "ignore" }).unref();
+}
+
 function minimalContinuousState(addReport) {
   return {
     mode: "parcial_progressivo",
@@ -517,6 +735,8 @@ async function streamSrcPipeline(response, rootPath, options = {}) {
   const startedAt = Date.now();
   let latestProgress = null;
   let latestScanProgress = null;
+  let latestResult = null;
+  let finalReport = null;
   const heartbeat = setInterval(() => {
     if (!response.writableEnded && !response.destroyed) {
       response.write(`${JSON.stringify({
@@ -541,23 +761,84 @@ async function streamSrcPipeline(response, rootPath, options = {}) {
         latestScanProgress = progress;
       }
     })) {
+      latestResult = result;
       latestProgress = result.progressive || latestProgress;
+      if (result.progressive?.isFinal) {
+        finalReport = await writeScanFinalReport(buildServerScanFinalReport("concluido", result, {
+          startedAt,
+          latestScanProgress
+        }));
+      }
       await writeNdjson(response, {
         type: "snapshot",
         progress: result.progressive,
-        result: compactStreamResult(result, options)
+        result: compactStreamResult(result, options),
+        finalReport
       });
     }
-    await writeNdjson(response, { type: "done" });
+    if (!finalReport && latestResult) {
+      finalReport = await writeScanFinalReport(buildServerScanFinalReport("concluido", latestResult, {
+        startedAt,
+        latestScanProgress
+      }));
+    }
+    await writeNdjson(response, { type: "done", finalReport });
   } catch (error) {
+    finalReport = await writeScanFinalReport(buildServerScanFinalReport("falhou", latestResult, {
+      startedAt,
+      latestScanProgress,
+      error: error.message || "Erro inesperado na varredura progressiva."
+    })).catch(() => null);
     await writeNdjson(response, {
       type: "error",
-      error: error.message || "Erro inesperado na varredura progressiva."
+      error: error.message || "Erro inesperado na varredura progressiva.",
+      finalReport
     });
   } finally {
     clearInterval(heartbeat);
     response.end();
   }
+}
+
+function buildServerScanFinalReport(status, result, context = {}) {
+  const summary = result?.summary || {};
+  const totalSeconds = Math.max(0, (Date.now() - Number(context.startedAt || Date.now())) / 1000);
+  const scanningSeconds = Math.max(0, Number(context.latestScanProgress?.elapsedMs || 0) / 1000);
+  const analyzingSeconds = Math.max(0, totalSeconds - scanningSeconds);
+  const processedBytes = Number(summary.totalBytes || 0);
+  return {
+    status,
+    filesAnalyzed: Number(summary.analyzedFiles || summary.files || 0),
+    filesProcessed: Number(summary.files || 0),
+    filesMoved: 0,
+    filesSkipped: Array.isArray(result?.skipped) ? result.skipped.length : Number(summary.skipped || 0),
+    errors: context.error ? 1 : 0,
+    warnings: Array.isArray(result?.warnings) ? result.warnings.length : Number(summary.warnings || 0),
+    processedBytes,
+    processedHuman: formatBytesServer(processedBytes),
+    totalSeconds,
+    stageTimings: {
+      scanning: scanningSeconds,
+      analyzing: analyzingSeconds,
+      logging: 0,
+      total: totalSeconds
+    },
+    averageSpeedBytesPerSecond: totalSeconds > 0 ? processedBytes / totalSeconds : 0,
+    logPath: null,
+    error: context.error || null
+  };
+}
+
+async function writeScanFinalReport(report) {
+  const startedAt = Date.now();
+  const directory = operationLogDirectory();
+  await fs.mkdir(directory, { recursive: true });
+  const filePath = path.join(directory, `${createOperationId()}-scan-report.json`);
+  report.logPath = filePath;
+  report.stageTimings.logging = Math.max(0, (Date.now() - startedAt) / 1000);
+  report.stageTimings.total = Number(report.totalSeconds || 0) + report.stageTimings.logging;
+  await fs.writeFile(filePath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  return report;
 }
 
 async function writeNdjson(response, payload) {

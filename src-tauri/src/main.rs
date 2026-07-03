@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 static ALC_CANCELLED: AtomicBool = AtomicBool::new(false);
+static SCAN_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +24,8 @@ struct AlcRelocationRequest {
     plan_mode: Option<String>,
     target_bytes: Option<u64>,
     expand_plan: Option<bool>,
+    dry_run: Option<bool>,
+    allow_permanent_delete: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,20 +43,33 @@ struct AlcFileSelection {
     relative_path: String,
     size: Option<u64>,
     user_content: Option<bool>,
+    risk: Option<String>,
+    reason: Option<String>,
+    deletion_decision: Option<String>,
+    planned_destination: Option<String>,
+    manual_approval: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AlcRelocationReport {
     target_kind: String,
+    effective_action: String,
+    dry_run: bool,
     target_directory: Option<String>,
+    quarantine_directory: Option<String>,
+    manifest_path: Option<String>,
+    final_manifest_path: Option<String>,
     requested_files: usize,
+    planned_files: usize,
     moved_files: usize,
     failed_files: usize,
     skipped_files: usize,
     cancelled_files: usize,
     cancelled: bool,
+    planned_bytes: u64,
     moved_bytes: u64,
+    stage_timings: Value,
     operations: Vec<AlcOperationReport>,
 }
 
@@ -79,9 +95,15 @@ struct AlcExpandReport {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AlcOperationReport {
+    id: String,
     relative_path: String,
+    original_path: Option<String>,
     size_bytes: u64,
     status: String,
+    action: String,
+    reason: String,
+    risk: Option<String>,
+    planned_destination: Option<String>,
     target_path: Option<String>,
     user_content: bool,
     error: Option<String>,
@@ -92,6 +114,20 @@ const ALC_TRASH_BATCH_SIZE: usize = 256;
 const ALC_PROGRESS_FILE_INTERVAL: usize = 64;
 const ALC_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
 const ALC_COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const SCAN_PROGRESS_FILE_INTERVAL: u64 = 128;
+const SCAN_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Default, Clone)]
+struct ScanJobProgress {
+    files: u64,
+    directories: u64,
+    bytes: u64,
+    skipped: u64,
+    warnings: u64,
+    errors: u64,
+    cancelled: bool,
+    current_file: Option<String>,
+}
 
 struct PreparedAlcFile {
     source: PathBuf,
@@ -195,6 +231,443 @@ fn analyze_maidspace(
 #[tauri::command(rename_all = "camelCase")]
 fn analyze_add(root_path: String) -> Result<Value, String> {
     analyze_maidspace(root_path, None, None)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn start_scan_job(
+    app: AppHandle,
+    root_path: String,
+    target_free_bytes: Option<u64>,
+    minimum_free_bytes: Option<u64>,
+) -> Result<String, String> {
+    let root = fs::canonicalize(&root_path)
+        .map_err(|error| format!("Nao foi possivel acessar a raiz: {error}"))?;
+    if !root.is_dir() {
+        return Err(format!("A raiz nao e um diretorio: {}", root.display()));
+    }
+
+    let job_id = operation_id();
+    let thread_job_id = job_id.clone();
+    SCAN_CANCELLED.store(false, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        run_scan_job_thread(
+            app,
+            thread_job_id,
+            root,
+            target_free_bytes.unwrap_or(0),
+            minimum_free_bytes.unwrap_or(0),
+        );
+    });
+    Ok(job_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn cancel_scan_job(_job_id: Option<String>) -> Result<(), String> {
+    SCAN_CANCELLED.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn run_scan_job_thread(
+    app: AppHandle,
+    job_id: String,
+    root: PathBuf,
+    target_free_bytes: u64,
+    minimum_free_bytes: u64,
+) {
+    let started_at = Instant::now();
+    emit_scan_progress(
+        &app,
+        &job_id,
+        "scanning",
+        None,
+        &ScanJobProgress::default(),
+        0,
+        0,
+        started_at,
+        false,
+        "Varrendo arquivos",
+        None,
+        None,
+    );
+
+    let scan_started = Instant::now();
+    let inventory = scan_for_job_progress(&app, &job_id, &root, started_at);
+    let scanning_seconds = scan_started.elapsed().as_secs_f64();
+
+    if inventory.cancelled || SCAN_CANCELLED.load(Ordering::Relaxed) {
+        let mut final_report = scan_final_report_json(
+            "cancelado",
+            &inventory,
+            started_at,
+            scanning_seconds,
+            0.0,
+            None,
+        );
+        attach_scan_log(&job_id, &mut final_report);
+        emit_scan_progress(
+            &app,
+            &job_id,
+            "cancelled",
+            inventory.current_file.as_deref(),
+            &inventory,
+            inventory.files,
+            inventory.bytes,
+            started_at,
+            true,
+            "Varredura cancelada com seguranca",
+            None,
+            Some(final_report),
+        );
+        return;
+    }
+
+    emit_scan_progress(
+        &app,
+        &job_id,
+        "analyzing",
+        inventory.current_file.as_deref(),
+        &inventory,
+        inventory.files,
+        inventory.bytes,
+        started_at,
+        true,
+        "Analisando riscos e plano A.R.E",
+        None,
+        None,
+    );
+
+    let analyze_started = Instant::now();
+    let report = match analyze_directory(&root, AnalyzeOptions::default()) {
+        Ok(report) => report,
+        Err(error) => {
+            let mut failed = inventory.clone();
+            failed.errors = failed.errors.saturating_add(1);
+            let mut final_report = scan_final_report_json(
+                "falhou",
+                &failed,
+                started_at,
+                scanning_seconds,
+                analyze_started.elapsed().as_secs_f64(),
+                Some(&error.to_string()),
+            );
+            attach_scan_log(&job_id, &mut final_report);
+            emit_scan_progress(
+                &app,
+                &job_id,
+                "failed",
+                failed.current_file.as_deref(),
+                &failed,
+                failed.files,
+                failed.bytes,
+                started_at,
+                true,
+                "Falha na analise local",
+                None,
+                Some(final_report),
+            );
+            return;
+        }
+    };
+    let analyzing_seconds = analyze_started.elapsed().as_secs_f64();
+
+    if SCAN_CANCELLED.load(Ordering::Relaxed) {
+        let mut final_report = scan_final_report_json(
+            "cancelado",
+            &inventory,
+            started_at,
+            scanning_seconds,
+            analyzing_seconds,
+            None,
+        );
+        attach_scan_log(&job_id, &mut final_report);
+        emit_scan_progress(
+            &app,
+            &job_id,
+            "cancelled",
+            inventory.current_file.as_deref(),
+            &inventory,
+            inventory.files,
+            inventory.bytes,
+            started_at,
+            true,
+            "Cancelado apos a etapa atual",
+            None,
+            Some(final_report),
+        );
+        return;
+    }
+
+    let disk_status = disk_status_value(&report.root_path).unwrap_or_else(|error| json!({
+        "available": false,
+        "error": error
+    }));
+    let result = json!({
+        "mode": "local_tauri_job",
+        "targetFreeBytes": target_free_bytes,
+        "minimumFreeBytes": minimum_free_bytes,
+        "diskStatus": disk_status,
+        "report": report
+    });
+    let mut final_report = scan_final_report_json(
+        "concluido",
+        &inventory,
+        started_at,
+        scanning_seconds,
+        analyzing_seconds,
+        None,
+    );
+    attach_scan_log(&job_id, &mut final_report);
+    emit_scan_progress(
+        &app,
+        &job_id,
+        "finished",
+        inventory.current_file.as_deref(),
+        &inventory,
+        inventory.files,
+        inventory.bytes,
+        started_at,
+        true,
+        "Varredura concluida",
+        Some(result),
+        Some(final_report),
+    );
+}
+
+fn scan_for_job_progress(
+    app: &AppHandle,
+    job_id: &str,
+    root: &Path,
+    started_at: Instant,
+) -> ScanJobProgress {
+    let mut progress = ScanJobProgress::default();
+    let mut stack = VecDeque::new();
+    let mut last_emit = Instant::now()
+        .checked_sub(SCAN_PROGRESS_TIME_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    stack.push_back(root.to_path_buf());
+
+    while let Some(directory) = stack.pop_back() {
+        if SCAN_CANCELLED.load(Ordering::Relaxed) {
+            progress.cancelled = true;
+            break;
+        }
+        progress.directories = progress.directories.saturating_add(1);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                progress.skipped = progress.skipped.saturating_add(1);
+                progress.warnings = progress.warnings.saturating_add(1);
+                continue;
+            }
+        };
+
+        for entry in entries {
+            if SCAN_CANCELLED.load(Ordering::Relaxed) {
+                progress.cancelled = true;
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    progress.skipped = progress.skipped.saturating_add(1);
+                    progress.warnings = progress.warnings.saturating_add(1);
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    progress.skipped = progress.skipped.saturating_add(1);
+                    progress.warnings = progress.warnings.saturating_add(1);
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push_back(entry.path());
+            } else if file_type.is_file() {
+                progress.files = progress.files.saturating_add(1);
+                progress.current_file = Some(entry.path().display().to_string());
+                match entry.metadata() {
+                    Ok(metadata) => {
+                        progress.bytes = progress.bytes.saturating_add(metadata.len());
+                    }
+                    Err(_) => {
+                        progress.skipped = progress.skipped.saturating_add(1);
+                        progress.warnings = progress.warnings.saturating_add(1);
+                    }
+                }
+            } else {
+                progress.skipped = progress.skipped.saturating_add(1);
+            }
+
+            if progress.files % SCAN_PROGRESS_FILE_INTERVAL == 0
+                || last_emit.elapsed() >= SCAN_PROGRESS_TIME_INTERVAL
+            {
+                emit_scan_progress(
+                    app,
+                    job_id,
+                    "scanning",
+                    progress.current_file.as_deref(),
+                    &progress,
+                    0,
+                    0,
+                    started_at,
+                    false,
+                    "Varrendo arquivos",
+                    None,
+                    None,
+                );
+                last_emit = Instant::now();
+            }
+        }
+    }
+
+    emit_scan_progress(
+        app,
+        job_id,
+        if progress.cancelled { "cancelled" } else { "scanning" },
+        progress.current_file.as_deref(),
+        &progress,
+        progress.files,
+        progress.bytes,
+        started_at,
+        true,
+        if progress.cancelled {
+            "Cancelamento solicitado"
+        } else {
+            "Inventario inicial concluido"
+        },
+        None,
+        None,
+    );
+    progress
+}
+
+fn emit_scan_progress(
+    app: &AppHandle,
+    job_id: &str,
+    stage: &str,
+    current_file: Option<&str>,
+    progress: &ScanJobProgress,
+    total_files: u64,
+    total_bytes: u64,
+    started_at: Instant,
+    total_known: bool,
+    message: &str,
+    result: Option<Value>,
+    final_report: Option<Value>,
+) {
+    let elapsed_seconds = started_at.elapsed().as_secs_f64();
+    let speed = if elapsed_seconds > 0.0 {
+        progress.bytes as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+    let percent = if total_known && total_bytes > 0 {
+        ((progress.bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
+    } else if total_known && total_files > 0 {
+        ((progress.files as f64 / total_files as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let estimated_remaining_seconds = if percent > 0.0 && percent < 100.0 {
+        Some(elapsed_seconds * ((100.0 - percent) / percent))
+    } else {
+        None
+    };
+    let mut payload = json!({
+        "jobId": job_id,
+        "stage": stage,
+        "currentFile": current_file.unwrap_or(""),
+        "processedFiles": progress.files,
+        "totalFiles": total_files,
+        "totalKnown": total_known,
+        "processedBytes": progress.bytes,
+        "totalBytes": total_bytes,
+        "elapsedSeconds": elapsed_seconds,
+        "estimatedRemainingSeconds": estimated_remaining_seconds,
+        "currentSpeedBytesPerSecond": speed,
+        "warningsCount": progress.warnings,
+        "skippedCount": progress.skipped,
+        "errorsCount": progress.errors,
+        "percent": percent,
+        "message": message,
+        "cancelled": progress.cancelled || SCAN_CANCELLED.load(Ordering::Relaxed),
+    });
+    if let Some(result) = result {
+        payload["result"] = result;
+    }
+    if let Some(final_report) = final_report {
+        payload["finalReport"] = final_report;
+    }
+    let _ = app.emit("scan-progress", payload);
+}
+
+fn scan_final_report_json(
+    status: &str,
+    progress: &ScanJobProgress,
+    started_at: Instant,
+    scanning_seconds: f64,
+    analyzing_seconds: f64,
+    error: Option<&str>,
+) -> Value {
+    let total_seconds = started_at.elapsed().as_secs_f64();
+    json!({
+        "status": status,
+        "filesAnalyzed": progress.files,
+        "filesProcessed": progress.files,
+        "filesMoved": 0,
+        "filesSkipped": progress.skipped,
+        "errors": progress.errors,
+        "warnings": progress.warnings,
+        "processedBytes": progress.bytes,
+        "processedHuman": format_bytes(progress.bytes),
+        "totalSeconds": total_seconds,
+        "stageTimings": {
+            "scanning": scanning_seconds,
+            "analyzing": analyzing_seconds,
+            "moving": 0.0,
+            "quarantining": 0.0,
+            "logging": 0.0,
+            "total": total_seconds
+        },
+        "averageSpeedBytesPerSecond": if total_seconds > 0.0 {
+            progress.bytes as f64 / total_seconds
+        } else {
+            0.0
+        },
+        "logPath": null,
+        "error": error
+    })
+}
+
+fn attach_scan_log(job_id: &str, report: &mut Value) {
+    if let Err(error) = write_scan_final_report(job_id, report) {
+        report["logError"] = json!(error);
+    }
+}
+
+fn write_scan_final_report(job_id: &str, report: &mut Value) -> Result<(), String> {
+    let logging_started = Instant::now();
+    let directory = operation_log_dir();
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Nao foi possivel criar diretorio de log: {error}"))?;
+    let path = directory.join(format!("{job_id}-scan-report.json"));
+    report["logPath"] = json!(path.display().to_string());
+    let first_pass = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("Nao foi possivel serializar relatorio: {error}"))?;
+    fs::write(&path, format!("{first_pass}\n"))
+        .map_err(|error| format!("Nao foi possivel gravar relatorio: {error}"))?;
+    let logging_seconds = logging_started.elapsed().as_secs_f64();
+    report["stageTimings"]["logging"] = json!(logging_seconds);
+    let total = report["totalSeconds"].as_f64().unwrap_or(0.0) + logging_seconds;
+    report["stageTimings"]["total"] = json!(total);
+    let final_pass = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("Nao foi possivel serializar relatorio final: {error}"))?;
+    fs::write(&path, format!("{final_pass}\n"))
+        .map_err(|error| format!("Nao foi possivel atualizar relatorio: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -489,6 +962,8 @@ fn execute_alc_relocation(
     request: AlcRelocationRequest,
 ) -> Result<AlcRelocationReport, String> {
     ALC_CANCELLED.store(false, Ordering::Relaxed);
+    let operation_started = Instant::now();
+    let planning_started = Instant::now();
     let root = fs::canonicalize(&request.root_path)
         .map_err(|error| format!("Nao foi possivel acessar a raiz: {error}"))?;
     if !root.is_dir() {
@@ -496,9 +971,27 @@ fn execute_alc_relocation(
     }
 
     let target_kind = request.target_kind.trim().to_ascii_lowercase();
-    if target_kind != "directory" && target_kind != "trash" && target_kind != "delete" {
+    if target_kind != "directory"
+        && target_kind != "trash"
+        && target_kind != "delete"
+        && target_kind != "quarantine"
+    {
         return Err(String::from("Destino A.L.C invalido."));
     }
+    let dry_run = request.dry_run.unwrap_or(false);
+    let allow_permanent_delete = request.allow_permanent_delete.unwrap_or(false);
+    let effective_action = effective_alc_action(&target_kind, allow_permanent_delete);
+    if request.expand_plan.unwrap_or(false) && !dry_run {
+        return Err(String::from(
+            "Expanda ou simule o plano antes de executar; a execucao real exige lista auditavel no manifesto.",
+        ));
+    }
+    let operation_id = operation_id();
+    let quarantine_root = if effective_action == "quarantine" {
+        Some(quarantine_directory(&operation_id))
+    } else {
+        None
+    };
 
     let target_directory = if target_kind == "directory" {
         let value = request
@@ -518,6 +1011,8 @@ fn execute_alc_relocation(
             ));
         }
         Some(canonical)
+    } else if let Some(quarantine) = quarantine_root.as_ref() {
+        Some(quarantine.join("files"))
     } else {
         None
     };
@@ -527,22 +1022,30 @@ fn execute_alc_relocation(
         .iter()
         .fold(0u64, |sum, file| sum.saturating_add(file.size.unwrap_or(0)));
     let target_bytes = request.target_bytes.unwrap_or(0);
-    let should_expand_plan = request.expand_plan.unwrap_or(false)
-        || (target_bytes > 0
-            && requested_preview_bytes < target_bytes.saturating_sub(target_bytes / 50));
+    let should_expand_plan = false;
 
     let mut report = AlcRelocationReport {
         target_kind: target_kind.clone(),
+        effective_action: effective_action.clone(),
+        dry_run,
         target_directory: target_directory
             .as_ref()
             .map(|path| path.display().to_string()),
+        quarantine_directory: quarantine_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        manifest_path: None,
+        final_manifest_path: None,
         requested_files: 0,
+        planned_files: 0,
         moved_files: 0,
         failed_files: 0,
         skipped_files: 0,
         cancelled_files: 0,
         cancelled: false,
+        planned_bytes: 0,
         moved_bytes: 0,
+        stage_timings: json!({}),
         operations: Vec::with_capacity(files.len().min(MAX_OPERATION_REPORTS)),
     };
     let mut seen = HashSet::new();
@@ -563,6 +1066,21 @@ fn execute_alc_relocation(
     );
 
     let mut progress_ticker = AlcProgressTicker::new();
+    let manifest = operation_manifest_json(
+        &operation_id,
+        &root,
+        &target_kind,
+        &effective_action,
+        dry_run,
+        target_directory.as_deref(),
+        quarantine_root.as_deref(),
+        &files,
+        &[],
+    );
+    report.manifest_path = Some(write_operation_manifest(&operation_id, false, &manifest)?);
+    let planning_seconds = planning_started.elapsed().as_secs_f64();
+    let execution_started = Instant::now();
+
     let mut trash_batch = Vec::with_capacity(ALC_TRASH_BATCH_SIZE);
     let mut created_directories = HashSet::new();
 
@@ -573,12 +1091,16 @@ fn execute_alc_relocation(
         }
 
         if let Some(prepared) = prepare_alc_file(&root, file, &mut report, &mut seen) {
-            if target_kind == "trash" {
+            report.planned_files += 1;
+            report.planned_bytes = report.planned_bytes.saturating_add(prepared.operation.size_bytes);
+            if dry_run {
+                mark_prepared_planned(prepared, &mut report);
+            } else if effective_action == "trash" {
                 trash_batch.push(prepared);
                 if trash_batch.len() >= ALC_TRASH_BATCH_SIZE {
                     flush_trash_batch(&mut trash_batch, &mut report);
                 }
-            } else if target_kind == "delete" {
+            } else if effective_action == "delete_permanent" {
                 delete_prepared_file(prepared, &mut report);
             } else {
                 move_prepared_file_to_directory(
@@ -586,6 +1108,11 @@ fn execute_alc_relocation(
                     prepared,
                     &mut report,
                     &mut created_directories,
+                    if effective_action == "quarantine" {
+                        Some("quarantined")
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -605,7 +1132,7 @@ fn execute_alc_relocation(
         );
     }
 
-    if report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed) {
+    if dry_run || report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed) {
         cancel_trash_batch(&mut trash_batch, &mut report);
     } else {
         flush_trash_batch(&mut trash_batch, &mut report);
@@ -643,6 +1170,41 @@ fn execute_alc_relocation(
     }
 
     report.cancelled = report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed);
+    let execution_seconds = execution_started.elapsed().as_secs_f64();
+    let logging_started = Instant::now();
+    let final_manifest = operation_manifest_json(
+        &operation_id,
+        &root,
+        &target_kind,
+        &effective_action,
+        dry_run,
+        target_directory.as_deref(),
+        quarantine_root.as_deref(),
+        &[],
+        &report.operations,
+    );
+    report.final_manifest_path = Some(write_operation_manifest(&operation_id, true, &final_manifest)?);
+    let logging_seconds = logging_started.elapsed().as_secs_f64();
+    let mut moving_seconds = 0.0;
+    let mut deleting_seconds = 0.0;
+    let mut quarantining_seconds = 0.0;
+    if !dry_run {
+        if effective_action == "delete_permanent" {
+            deleting_seconds = execution_seconds;
+        } else if effective_action == "quarantine" {
+            quarantining_seconds = execution_seconds;
+        } else {
+            moving_seconds = execution_seconds;
+        }
+    }
+    report.stage_timings = json!({
+        "planning": planning_seconds,
+        "moving": moving_seconds,
+        "deleting": deleting_seconds,
+        "quarantining": quarantining_seconds,
+        "logging": logging_seconds,
+        "total": operation_started.elapsed().as_secs_f64()
+    });
     emit_alc_progress(
         &app,
         if report.cancelled {
@@ -711,16 +1273,62 @@ fn reveal_in_explorer(root_path: String, relative_path: String) -> Result<(), St
     Ok(())
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn reveal_system_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    if target.as_os_str().is_empty() {
+        return Err(String::from("Caminho vazio."));
+    }
+    let reveal_target = if target.exists() {
+        target
+    } else {
+        target
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| String::from("Caminho sem pasta pai."))?
+    };
+
+    if cfg!(target_os = "windows") {
+        Command::new("explorer")
+            .arg(reveal_target.display().to_string())
+            .spawn()
+            .map_err(|error| format!("Nao foi possivel abrir o Explorer: {error}"))?;
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(&reveal_target)
+            .spawn()
+            .map_err(|error| format!("Nao foi possivel abrir o Finder: {error}"))?;
+    } else {
+        Command::new("xdg-open")
+            .arg(&reveal_target)
+            .spawn()
+            .map_err(|error| format!("Nao foi possivel abrir o gerenciador de arquivos: {error}"))?;
+    }
+
+    Ok(())
+}
+
 fn prepare_alc_file(
     root: &Path,
     file: AlcFileSelection,
     report: &mut AlcRelocationReport,
     seen: &mut HashSet<String>,
 ) -> Option<PreparedAlcFile> {
+    let operation_id = item_id_for(&file.relative_path);
     let mut operation = AlcOperationReport {
+        id: operation_id,
         relative_path: file.relative_path.clone(),
+        original_path: None,
         size_bytes: file.size.unwrap_or(0),
-        status: String::from("failed"),
+        status: String::from("error"),
+        action: String::from("planned"),
+        reason: file
+            .reason
+            .clone()
+            .or(file.deletion_decision.clone())
+            .unwrap_or_else(|| String::from("selecionado pelo A.L.C")),
+        risk: file.risk.clone(),
+        planned_destination: file.planned_destination.clone(),
         target_path: None,
         user_content: file.user_content.unwrap_or(false),
         error: None,
@@ -745,6 +1353,13 @@ fn prepare_alc_file(
         }
     };
     let relative_key = normalize_preference_key(&relative.display().to_string());
+    if let Some(reason) = protected_operation_reason(&relative_key, &file) {
+        operation.status = String::from("skipped");
+        operation.error = Some(reason);
+        report.skipped_files += 1;
+        push_operation_report(report, operation);
+        return None;
+    }
     if !seen.insert(relative_key) {
         return None;
     }
@@ -760,6 +1375,7 @@ fn prepare_alc_file(
         }
     };
 
+    operation.original_path = Some(source.display().to_string());
     if !source.starts_with(root) {
         operation.error = Some(String::from("Arquivo fora da raiz varrida."));
         report.failed_files += 1;
@@ -798,6 +1414,7 @@ fn move_prepared_file_to_directory(
     prepared: PreparedAlcFile,
     report: &mut AlcRelocationReport,
     created_directories: &mut HashSet<PathBuf>,
+    success_action: Option<&str>,
 ) {
     let PreparedAlcFile {
         source,
@@ -813,8 +1430,10 @@ fn move_prepared_file_to_directory(
     let destination = unique_destination(&target_root.join(&relative));
     let result = move_file_to(&source, &destination, created_directories)
         .map(|_| {
-            operation.status = String::from("moved");
+            operation.status = String::from("success");
+            operation.action = success_action.unwrap_or("moved").to_string();
             operation.target_path = Some(destination.display().to_string());
+            operation.planned_destination = operation.target_path.clone();
         })
         .map_err(|error| error.to_string());
 
@@ -830,7 +1449,7 @@ fn move_prepared_file_to_directory(
                 report.cancelled = true;
                 report.cancelled_files += 1;
             } else {
-                operation.status = String::from("failed");
+                operation.status = String::from("error");
                 operation.error = Some(error);
                 report.failed_files += 1;
             }
@@ -850,7 +1469,8 @@ fn delete_prepared_file(prepared: PreparedAlcFile, report: &mut AlcRelocationRep
     match result {
         Ok(()) => {
             let mut operation = prepared.operation;
-            operation.status = String::from("deleted");
+            operation.status = String::from("success");
+            operation.action = String::from("delete_permanent");
             operation.target_path = Some(String::from("excluido"));
             report.moved_files += 1;
             report.moved_bytes = report.moved_bytes.saturating_add(operation.size_bytes);
@@ -920,7 +1540,8 @@ fn trash_files_individually(
 
 fn mark_prepared_trashed(prepared: PreparedAlcFile, report: &mut AlcRelocationReport) {
     let mut operation = prepared.operation;
-    operation.status = String::from("trashed");
+    operation.status = String::from("success");
+    operation.action = String::from("trashed");
     operation.target_path = Some(String::from("lixeira"));
     report.moved_files += 1;
     report.moved_bytes = report.moved_bytes.saturating_add(operation.size_bytes);
@@ -933,7 +1554,7 @@ fn mark_prepared_failed(
     error: String,
 ) {
     let mut operation = prepared.operation;
-    operation.status = String::from("failed");
+    operation.status = String::from("error");
     operation.error = Some(error);
     report.failed_files += 1;
     push_operation_report(report, operation);
@@ -945,6 +1566,16 @@ fn mark_prepared_cancelled(prepared: PreparedAlcFile, report: &mut AlcRelocation
     operation.error = Some(String::from("Cancelado."));
     report.cancelled = true;
     report.cancelled_files += 1;
+    push_operation_report(report, operation);
+}
+
+fn mark_prepared_planned(prepared: PreparedAlcFile, report: &mut AlcRelocationReport) {
+    let mut operation = prepared.operation;
+    operation.status = String::from("planned");
+    operation.action = report.effective_action.clone();
+    if operation.planned_destination.is_none() {
+        operation.planned_destination = planned_destination_from_report(report, &operation.relative_path);
+    }
     push_operation_report(report, operation);
 }
 
@@ -1080,6 +1711,11 @@ fn stream_relocate_alc_plan(
                         &normalized_relative,
                         &extension,
                     )),
+                    risk: None,
+                    reason: Some(String::from("expansao local A.L.C")),
+                    deletion_decision: None,
+                    planned_destination: None,
+                    manual_approval: None,
                 },
                 report,
                 seen,
@@ -1097,12 +1733,13 @@ fn stream_relocate_alc_plan(
                 } else if target_kind == "delete" {
                     delete_prepared_file(prepared, report);
                 } else {
-                    move_prepared_file_to_directory(
-                        target_directory,
-                        prepared,
-                        report,
-                        &mut created_directories,
-                    );
+                move_prepared_file_to_directory(
+                    target_directory,
+                    prepared,
+                    report,
+                    &mut created_directories,
+                    None,
+                );
                 }
             }
             progress_ticker.emit(
@@ -1188,6 +1825,252 @@ fn emit_alc_progress(
             "cancelled": report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed)
         }),
     );
+}
+
+fn effective_alc_action(target_kind: &str, allow_permanent_delete: bool) -> String {
+    match target_kind {
+        "directory" => String::from("move"),
+        "trash" => String::from("trash"),
+        "delete" if allow_permanent_delete => String::from("delete_permanent"),
+        _ => String::from("quarantine"),
+    }
+}
+
+fn operation_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("op-{millis}-{}", std::process::id())
+}
+
+fn maidspace_data_dir() -> PathBuf {
+    if let Ok(custom_dir) = env::var("MAIDSPACE_DATA_DIR") {
+        return PathBuf::from(custom_dir);
+    }
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data).join("MaidSpace");
+    }
+    env::temp_dir().join("MaidSpace")
+}
+
+fn operation_log_dir() -> PathBuf {
+    maidspace_data_dir().join("operations")
+}
+
+fn quarantine_directory(operation_id: &str) -> PathBuf {
+    maidspace_data_dir().join("quarantine").join(operation_id)
+}
+
+fn write_operation_manifest(
+    operation_id: &str,
+    final_manifest: bool,
+    manifest: &Value,
+) -> Result<String, String> {
+    let directory = operation_log_dir();
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Nao foi possivel criar pasta de manifestos: {error}"))?;
+    let suffix = if final_manifest { "final" } else { "planned" };
+    let path = directory.join(format!("{operation_id}.{suffix}.json"));
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("Nao foi possivel serializar manifesto: {error}"))?;
+    fs::write(&path, format!("{text}\n"))
+        .map_err(|error| format!("Nao foi possivel salvar manifesto: {error}"))?;
+    Ok(path.display().to_string())
+}
+
+fn operation_manifest_json(
+    operation_id: &str,
+    root: &Path,
+    target_kind: &str,
+    effective_action: &str,
+    dry_run: bool,
+    target_directory: Option<&Path>,
+    quarantine_root: Option<&Path>,
+    files: &[AlcFileSelection],
+    operations: &[AlcOperationReport],
+) -> Value {
+    let items: Vec<Value> = if operations.is_empty() {
+        files
+            .iter()
+            .map(|file| {
+                let relative = normalize_preference_key(&file.relative_path);
+                let protected = protected_operation_reason(&relative, file);
+                let action = if protected.is_some() {
+                    String::from("skip")
+                } else {
+                    effective_action.to_string()
+                };
+                json!({
+                    "id": item_id_for(&relative),
+                    "originalPath": root.join(&relative).display().to_string(),
+                    "relativePath": relative,
+                    "sizeBytes": file.size.unwrap_or(0),
+                    "action": action,
+                    "proposedAction": action,
+                    "reason": file.reason.clone().or(file.deletion_decision.clone()).unwrap_or_else(|| String::from("selecionado pelo A.L.C")),
+                    "risk": file.risk.clone(),
+                    "plannedDestination": planned_destination_for_manifest(&relative, effective_action, target_directory, quarantine_root),
+                    "status": if protected.is_some() { "skipped" } else { "planned" },
+                    "error": protected,
+                    "finalPath": Value::Null,
+                    "manualApproval": file.manual_approval.unwrap_or(false)
+                })
+            })
+            .collect()
+    } else {
+        operations.iter().map(operation_to_manifest_item).collect()
+    };
+    let planned_items: Vec<&Value> = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) != Some("skipped"))
+        .collect();
+    let total_bytes = planned_items.iter().fold(0u64, |sum, item| {
+        sum.saturating_add(item.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0))
+    });
+
+    json!({
+        "schemaVersion": 1,
+        "operationId": operation_id,
+        "timestamp": now_iso_like(),
+        "mode": if dry_run { "dry-run" } else { "real" },
+        "rootPath": root.display().to_string(),
+        "targetKind": target_kind,
+        "effectiveAction": effective_action,
+        "targetDirectory": target_directory.map(|path| path.display().to_string()),
+        "quarantineDirectory": quarantine_root.map(|path| path.display().to_string()),
+        "totalFiles": planned_items.len(),
+        "totalBytes": total_bytes,
+        "status": if operations.is_empty() { "created" } else { "completed" },
+        "items": items
+    })
+}
+
+fn operation_to_manifest_item(operation: &AlcOperationReport) -> Value {
+    json!({
+        "id": operation.id,
+        "originalPath": operation.original_path,
+        "relativePath": operation.relative_path,
+        "sizeBytes": operation.size_bytes,
+        "action": operation.action,
+        "proposedAction": operation.action,
+        "reason": operation.reason,
+        "risk": operation.risk,
+        "plannedDestination": operation.planned_destination,
+        "status": operation.status,
+        "error": operation.error,
+        "finalPath": operation.target_path,
+        "manualApproval": Value::Null
+    })
+}
+
+fn planned_destination_for_manifest(
+    relative: &str,
+    action: &str,
+    target_directory: Option<&Path>,
+    quarantine_root: Option<&Path>,
+) -> Option<String> {
+    match action {
+        "move" => target_directory.map(|path| path.join(relative).display().to_string()),
+        "quarantine" => quarantine_root.map(|path| path.join("files").join(relative).display().to_string()),
+        "trash" => Some(String::from("lixeira")),
+        "delete_permanent" => Some(String::from("exclusao_permanente")),
+        _ => None,
+    }
+}
+
+fn planned_destination_from_report(report: &AlcRelocationReport, relative: &str) -> Option<String> {
+    match report.effective_action.as_str() {
+        "move" => report
+            .target_directory
+            .as_ref()
+            .map(|directory| PathBuf::from(directory).join(relative).display().to_string()),
+        "quarantine" => report
+            .quarantine_directory
+            .as_ref()
+            .map(|directory| PathBuf::from(directory).join("files").join(relative).display().to_string()),
+        "trash" => Some(String::from("lixeira")),
+        "delete_permanent" => Some(String::from("exclusao_permanente")),
+        _ => None,
+    }
+}
+
+fn item_id_for(relative: &str) -> String {
+    let normalized = normalize_preference_key(relative);
+    let mut id = String::from("item-");
+    for ch in normalized.chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch);
+        } else {
+            id.push('-');
+        }
+    }
+    id
+}
+
+fn protected_operation_reason(relative: &str, file: &AlcFileSelection) -> Option<String> {
+    let normalized = normalize_preference_key(relative);
+    if normalized.is_empty() {
+        return Some(String::from("caminho vazio"));
+    }
+    if is_strict_system_path("", &normalized)
+        || [
+            "windows/system32/",
+            "windows/syswow64/",
+            "windows/winsxs/",
+            "windows/servicing/",
+            "windows/systemresources/",
+            "windows/security/",
+            "windows/inf/",
+            "windows/assembly/",
+            "programdata/microsoft/",
+            "system volume information/",
+            "$winreagent/",
+            "$recycle.bin/",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return Some(String::from("diretorio critico do Windows ou do sistema"));
+    }
+    let parts: Vec<&str> = normalized.split('/').filter(|part| !part.is_empty()).collect();
+    if parts
+        .iter()
+        .any(|part| matches!(*part, ".git" | ".hg" | ".svn" | ".idea" | ".vscode" | "node_modules"))
+        || protected_file_name(Path::new(&normalized))
+    {
+        return Some(String::from("arquivo ou pasta de projeto protegido"));
+    }
+    let manual = file.manual_approval.unwrap_or(false);
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "saves" | "savegames" | "saved games" | "jogos salvos"))
+        && !manual
+    {
+        return Some(String::from("save ou progresso de jogo exige selecao manual"));
+    }
+    let personal = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "desktop"
+                | "documents"
+                | "documentos"
+                | "downloads"
+                | "pictures"
+                | "imagens"
+                | "videos"
+                | "music"
+                | "musicas"
+                | "onedrive"
+                | "dropbox"
+                | "google drive"
+                | "icloud drive"
+        )
+    });
+    if (file.user_content.unwrap_or(false) || personal) && !manual {
+        return Some(String::from("conteudo pessoal exige selecao manual"));
+    }
+    None
 }
 
 fn normalize_alc_mode(raw: &str) -> String {
@@ -1814,6 +2697,8 @@ fn main() {
             maidspace_disk,
             analyze_maidspace,
             analyze_add,
+            start_scan_job,
+            cancel_scan_job,
             pick_directory,
             load_preferences,
             save_file_decision,
@@ -1822,7 +2707,8 @@ fn main() {
             expand_alc_candidates,
             execute_alc_relocation,
             cancel_alc_relocation,
-            reveal_in_explorer
+            reveal_in_explorer,
+            reveal_system_path
         ])
         .run(tauri::generate_context!())
         .expect("erro ao iniciar MaidSpace");

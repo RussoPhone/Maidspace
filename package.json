@@ -5,16 +5,16 @@
   "description": "MaidSpace: utilitario local para manter espaco livre com inventario rapido e limpeza assistida.",
   "scripts": {
     "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-maidspace.ps1",
-    "core:check": "cargo check --manifest-path src-core/add-core/Cargo.toml",
-    "core:run": "cargo run --manifest-path src-core/add-core/Cargo.toml --",
+    "core:check": "cmd /c scripts\\with-vsdev.cmd cargo check --manifest-path src-core/add-core/Cargo.toml",
+    "core:run": "cmd /c scripts\\with-vsdev.cmd cargo run --manifest-path src-core/add-core/Cargo.toml --",
     "desktop": "npm run maidspace:dev",
     "fallback": "node src/desktop/launcher.js",
-    "maidspace:dev": "npx @tauri-apps/cli dev",
-    "maidspace:build": "npx @tauri-apps/cli build",
+    "maidspace:dev": "cmd /c scripts\\with-vsdev.cmd npx @tauri-apps/cli dev",
+    "maidspace:build": "cmd /c scripts\\with-vsdev.cmd npx @tauri-apps/cli build",
     "maidspace:build:local": "powershell -ExecutionPolicy Bypass -File scripts/maidspace-build.ps1",
     "start": "node server.js",
-    "tauri:dev": "npx @tauri-apps/cli dev",
-    "tauri:build": "npx @tauri-apps/cli build",
+    "tauri:dev": "npm run maidspace:dev",
+    "tauri:build": "npm run maidspace:build",
     "test": "node --test"
   },
   "devDependencies": {

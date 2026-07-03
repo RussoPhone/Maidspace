@@ -49,10 +49,15 @@
             <strong>Alerta</strong>
             <span id="spaceAlertText">0 B</span>
           </div>
-          <button id="scanButton" class="primary-button" type="button" title="Executar MaidSpace">
-            <span aria-hidden="true">▶</span>
-            Varrer
-          </button>
+          <div class="scan-actions">
+            <button id="scanButton" class="primary-button" type="button" title="Executar MaidSpace">
+              <span aria-hidden="true">▶</span>
+              Varrer
+            </button>
+            <button id="cancelScanButton" class="ghost-button" type="button" disabled>
+              Cancelar
+            </button>
+          </div>
           <div id="scanProgress" class="scan-progress is-hidden" data-mode="idle" aria-live="polite">
             <div class="progress-row">
               <span id="progressLabel">Pronto</span>
@@ -61,11 +66,18 @@
             <div class="progress-track" aria-label="Progresso da varredura">
               <span id="progressBar" class="progress-fill"></span>
             </div>
+            <div class="progress-metrics" aria-label="Metricas da varredura">
+              <span><b id="progressFiles">0 / 0</b><small>arquivos</small></span>
+              <span><b id="progressBytes">0 B / 0 B</b><small>dados</small></span>
+              <span><b id="progressEta">--</b><small>restante</small></span>
+              <span><b id="progressSpeed">0 B/s</b><small>velocidade</small></span>
+            </div>
+            <div id="progressCurrentFile" class="progress-current-file">-</div>
           </div>
-          <div id="systemLog" class="system-log" aria-live="polite">
-            <strong>Diario</strong>
+          <details id="systemLog" class="system-log" aria-live="polite">
+            <summary>Diario tecnico</summary>
             <ol id="systemLogList"></ol>
-          </div>
+          </details>
         </section>
 
         <section class="rail-section">
