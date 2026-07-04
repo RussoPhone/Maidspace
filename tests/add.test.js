@@ -701,6 +701,7 @@ test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
           dryRun: true,
           auditSource: "simulation",
           auditedItemCount: 1,
+          waveBytes: 4,
           files: [{ relativePath: "cache.tmp", size: 5, risk: "baixo", reason: "teste" }]
         }
       })
@@ -714,6 +715,9 @@ test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
     assert.ok(payload.manifestUsedPath);
     assert.equal(payload.auditSource, "simulation");
     assert.equal(payload.auditedItemCount, 1);
+    assert.equal(payload.waveBytes, 4);
+    assert.equal(payload.waveCount, 2);
+    assert.equal(payload.wavesCompleted, 0);
     assert.ok(payload.stageTimings);
     assert.ok(payload.stageTimings.planning >= 0);
     assert.ok(payload.stageTimings.logging >= 0);
@@ -754,12 +758,15 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
       targetDirectory: destination,
       auditSource: "expanded",
       auditedItemCount: 1,
+      waveBytes: 2,
       files: [{ relativePath: "move-me.txt" }]
     });
     assert.equal(moveReport.movedFiles, 1);
     assert.ok(moveReport.stageTimings.moving >= 0);
     assert.equal(moveReport.auditSource, "expanded");
     assert.equal(moveReport.auditedItemCount, 1);
+    assert.ok(moveReport.waveCount >= 1);
+    assert.equal(moveReport.wavesCompleted, moveReport.waveCount);
     assert.ok(moveReport.manifestUsedPath);
     assert.equal(moveReport.volumeInfo.known, true);
     await assert.rejects(fs.access(path.join(root, "move-me.txt")));
@@ -770,6 +777,7 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
       targetKind: "delete",
       auditSource: "expanded",
       auditedItemCount: 1,
+      waveBytes: 2,
       files: [{ relativePath: "delete-me.tmp" }]
     });
     assert.equal(deleteReport.movedFiles, 1);
@@ -777,6 +785,8 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
     assert.ok(deleteReport.stageTimings.quarantining >= 0);
     assert.equal(deleteReport.auditSource, "expanded");
     assert.equal(deleteReport.auditedItemCount, 1);
+    assert.ok(deleteReport.waveCount >= 1);
+    assert.equal(deleteReport.wavesCompleted, deleteReport.waveCount);
     await assert.rejects(fs.access(path.join(root, "delete-me.tmp")));
     await fs.access(path.join(deleteReport.quarantineDirectory, "files", "delete-me.tmp"));
 

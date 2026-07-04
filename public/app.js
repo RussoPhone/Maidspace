@@ -92,6 +92,9 @@ const riskWeight = {
   baixo: 1
 };
 
+const ALC_DEFAULT_WAVE_BYTES = 50 * 1024 * 1024 * 1024;
+const ALC_MAX_WAVE_FILES = 5000;
+
 const graphModes = {
   far: {
     key: "far",
@@ -124,6 +127,7 @@ const graphModes = {
 
 const elements = {
   serverStatus: document.querySelector("#serverStatus"),
+  helpButton: document.querySelector("#helpButton"),
   rootPath: document.querySelector("#rootPath"),
   chooseRootButton: document.querySelector("#chooseRootButton"),
   minimumFreeGb: document.querySelector("#minimumFreeGb"),
@@ -157,6 +161,7 @@ const elements = {
   filesTable: document.querySelector("#filesTable"),
   simulationGrid: document.querySelector("#simulationGrid"),
   areSummary: document.querySelector("#areSummary"),
+  relocationPanelHost: document.querySelector("#relocationPanelHost"),
   openAreModal: document.querySelector("#openAreModal"),
   closeAreModal: document.querySelector("#closeAreModal"),
   areModal: document.querySelector("#areModal"),
@@ -179,6 +184,7 @@ init();
 async function init() {
   bindEvents();
   renderEmpty();
+  showIntroTutorialIfNeeded();
 
   try {
     const health = await fetchJson("/api/health");
@@ -205,6 +211,7 @@ function bindEvents() {
   elements.minimumFreeGb?.addEventListener("change", handleSpacePreferenceChange);
   elements.targetFreeGb?.addEventListener("change", handleSpacePreferenceChange);
   elements.exportButton.addEventListener("click", exportJson);
+  elements.helpButton?.addEventListener("click", () => showIntroTutorial({ manual: true }));
   elements.graphFilter.addEventListener("change", renderGraph);
   elements.depthFilter?.addEventListener("change", () => {
     renderGraph();
@@ -3337,14 +3344,19 @@ function buildDecisionGroupsFromNodes(nodes) {
 }
 
 function renderRelocationPlan() {
-  if (!state.result || !elements.areSummary || !elements.areModalBody) {
+  if (!state.result || !elements.areSummary) {
     return;
   }
 
   const plan = state.result.relocationPlan;
   if (!plan) {
     elements.areSummary.innerHTML = empty("Painel indisponivel.");
-    elements.areModalBody.innerHTML = empty("Painel indisponivel.");
+    if (elements.relocationPanelHost) {
+      elements.relocationPanelHost.innerHTML = empty("Painel indisponivel.");
+    }
+    if (elements.areModalBody) {
+      elements.areModalBody.innerHTML = empty("Painel indisponivel.");
+    }
     if (elements.openAreModal) elements.openAreModal.disabled = true;
     if (elements.openAlcModal) elements.openAlcModal.disabled = true;
     if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty("Painel indisponivel.");
@@ -3354,7 +3366,14 @@ function renderRelocationPlan() {
   if (elements.openAreModal) elements.openAreModal.disabled = false;
   if (elements.openAlcModal) elements.openAlcModal.disabled = !hasAnyAlcPlanCandidates(plan);
   elements.areSummary.innerHTML = renderAreSummary(plan);
-  elements.areModalBody.innerHTML = renderRelocationPanel(plan);
+  if (elements.relocationPanelHost) {
+    elements.relocationPanelHost.innerHTML = renderRelocationPanel(plan);
+    wireAlcModalControls(elements.relocationPanelHost);
+  }
+  if (elements.areModalBody && !elements.areModal?.classList.contains("is-hidden")) {
+    elements.areModalBody.innerHTML = renderRelocationPanel(plan);
+    wireAlcModalControls(elements.areModalBody);
+  }
   elements.areSummary.querySelectorAll("[data-open-are-modal]").forEach((button) => {
     button.addEventListener("click", openAreModal);
   });
@@ -3391,9 +3410,10 @@ function renderAreSummary(plan) {
 
 function renderRelocationPanel(plan) {
   return `
+    ${renderCleanupHero(plan)}
     ${renderAlcModal()}
     <details class="relocation-details">
-      <summary>Detalhes A.R.E</summary>
+      <summary>Manifesto, A.R.E e detalhes tecnicos</summary>
       ${renderAreSimulation(plan)}
       ${renderAreDepthBreakdown(plan)}
       <section class="are-modal-summary">
@@ -3737,14 +3757,14 @@ function renderBlockedFiles(blockedFiles) {
 }
 
 function openAreModal() {
-  if (!state.result?.relocationPlan || !elements.areModal) {
+  if (!state.result?.relocationPlan) {
     return;
   }
-  elements.areModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
-  elements.areModal.classList.remove("is-hidden");
-  elements.areModal.setAttribute("aria-hidden", "false");
-  setModalOpenState();
-  wireAlcModalControls();
+  renderRelocationPlan();
+  const target = elements.relocationPanelHost || elements.areSummary;
+  target?.scrollIntoView({ behavior: "smooth", block: "start" });
+  target?.classList.add("focus-pulse");
+  window.setTimeout(() => target?.classList.remove("focus-pulse"), 900);
 }
 
 function closeAreModal() {
@@ -3769,6 +3789,59 @@ function setModalOpenState() {
   document.body.classList.toggle("modal-open", anyOpen);
 }
 
+function showIntroTutorialIfNeeded() {
+  if (localStorage.getItem("maidspace:intro-seen") === "true") {
+    return;
+  }
+  window.setTimeout(() => showIntroTutorial(), 300);
+}
+
+function showIntroTutorial({ manual = false } = {}) {
+  if (typeof document === "undefined" || !document.body) {
+    return;
+  }
+  if (!manual) {
+    localStorage.setItem("maidspace:intro-seen", "true");
+  }
+  const overlay = document.createElement("div");
+  overlay.className = "runtime-dialog-backdrop";
+  overlay.innerHTML = `
+    <section class="runtime-dialog intro-dialog" role="dialog" aria-modal="true" aria-labelledby="introTitle">
+      <h2 id="introTitle">Como usar</h2>
+      <p>Fluxo basico: 1. analise o espaco, 2. revise o plano, 3. execute a relocacao.</p>
+      <dl>
+        <dt>Mapa</dt><dd>Dependencias, grupos, riscos e selecao.</dd>
+        <dt>Relocacao</dt><dd>Plano, destino, waves, progresso e resultado.</dd>
+        <dt>Detalhes</dt><dd>Manifesto, log e arquivos afetados ficam recolhidos.</dd>
+      </dl>
+      <div class="runtime-dialog-actions">
+        <button id="closeIntroTutorial" class="primary-button" type="button">Entendi</button>
+      </div>
+    </section>
+  `;
+  const close = () => {
+    localStorage.setItem("maidspace:intro-seen", "true");
+    overlay.remove();
+  };
+  overlay.querySelector("#closeIntroTutorial")?.addEventListener("click", close);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      close();
+    }
+  });
+  document.body.appendChild(overlay);
+}
+
+function activeAlcControlRoot(root = null) {
+  if (root) {
+    return root;
+  }
+  if (elements.areModal && !elements.areModal.classList.contains("is-hidden") && elements.areModalBody) {
+    return elements.areModalBody;
+  }
+  return elements.relocationPanelHost || elements.alcModalBody || elements.areModalBody;
+}
+
 function renderAlcModal() {
   const filteredCandidates = getAlcCandidates({ limit: Infinity });
   const previewCandidates = getAlcCandidates({ limit: 260 });
@@ -3787,6 +3860,14 @@ function renderAlcModal() {
 
   const totalBytes = sourceCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
   const visibleBytes = filteredCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const plannedBytes = activeAlcTargetBytes(state.result.relocationPlan);
+  const plannedExecutionBytes = Math.max(plannedBytes, totalBytes);
+  const plannedExecutionFiles = Math.max(Number(targetPlan?.selectedFiles || 0), sourceCandidates.length);
+  const waves = buildAlcExecutionWaves({
+    files: sourceCandidates,
+    plannedBytes: plannedExecutionBytes,
+    plannedFiles: plannedExecutionFiles
+  });
   const userContentCount = filteredCandidates.filter(isLikelyUserContentCandidate).length;
   const nativeExecutor = isNativeMaidSpace();
   const activeMode = currentAlcAreMode();
@@ -3796,7 +3877,6 @@ function renderAlcModal() {
   const search = state.alcFilters.search || "";
   const planCards = renderAlcPlanCards(state.result.relocationPlan, activeMode);
   const expansion = state.alcExpandedCandidates?.[alcExpansionKeyForMode(activeMode, state.result.relocationPlan)];
-  const plannedBytes = activeAlcTargetBytes(state.result.relocationPlan);
   const needsExplorerExpansion = plannedBytes > totalBytes * 1.02;
   const estimateWarning = targetPlan?.status === "estimativa_exige_mais_detalhe"
     ? `<div class="alc-alert">Estimado</div>`
@@ -3821,7 +3901,7 @@ function renderAlcModal() {
       ${expansionWarning}
       ${userWarning}
       <div class="alc-summary">
-        <span><strong>${formatBytes(Math.max(plannedBytes, totalBytes))}</strong> plano</span>
+        <span><strong>${formatBytes(plannedExecutionBytes)}</strong> plano</span>
         <span><strong>${formatNumber(sourceCandidates.length)}</strong> previa</span>
         <span><strong>${formatBytes(visibleBytes)}</strong> visível</span>
         <span><strong>${escapeHtml(targetPlan?.targetHuman || "0 B")}</strong> meta</span>
@@ -3829,39 +3909,9 @@ function renderAlcModal() {
         <span><strong>${formatNumber(userSourceCandidates.length)}</strong> usuário</span>
         <span><strong>${formatNumber(Object.keys(state.preferences.fileDecisions || {}).length)}</strong> decisões</span>
       </div>
+      ${renderAlcWaveBoard(waves, plannedExecutionBytes)}
       ${planCards}
       ${renderRelocationTargetControls(state.result.relocationPlan)}
-      ${renderExemptionManager()}
-      <div class="alc-tab-row" role="tablist" aria-label="Visao">
-        <button class="mode-button${activeView === "all" ? " is-active" : ""}" type="button" data-alc-view="all">Todos</button>
-        <button class="mode-button${activeView === "user" ? " is-active" : ""}" type="button" data-alc-view="user">Usuario</button>
-      </div>
-      <div class="alc-filter-grid">
-        <label class="field">
-          <span>Buscar</span>
-          <input id="alcSearch" type="search" spellcheck="false" placeholder="nome" value="${escapeHtml(search)}">
-        </label>
-        <label class="field">
-          <span>Decisao</span>
-          <select id="alcDecisionFilter">
-            <option value="all"${activeDecision === "all" ? " selected" : ""}>Todas</option>
-            <option value="pode_apagar"${activeDecision === "pode_apagar" ? " selected" : ""}>Pode apagar</option>
-            <option value="inutil_provavel"${activeDecision === "inutil_provavel" ? " selected" : ""}>Inutil provavel</option>
-            <option value="averiguar"${activeDecision === "averiguar" ? " selected" : ""}>Averiguar</option>
-          </select>
-        </label>
-        <div class="field">
-          <span>Risco</span>
-          <div class="alc-risk-filter">
-            ${["baixo", "medio", "alto", "critico"].map((risk) => `
-              <label>
-                <input type="checkbox" data-alc-risk-filter="${escapeHtml(risk)}"${activeRisks.includes(risk) ? " checked" : ""}>
-                <span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span>
-              </label>
-            `).join("")}
-          </div>
-        </div>
-      </div>
       <div class="alc-control-grid" role="radiogroup" aria-label="Destino do A.L.C">
         <label class="alc-target-card">
           <input type="radio" name="alcTargetKind" value="directory"${state.alcDraft.targetKind === "directory" ? " checked" : ""}>
@@ -3894,8 +3944,17 @@ function renderAlcModal() {
         <span id="alcSelectedSummary" class="muted">...</span>
       </div>
       ${renderAlcOperationPreview(filteredCandidates, visibleBytes)}
-      ${renderAlcMiniExplorer(filteredCandidates, plannedBytes, totalBytes)}
-      ${renderAlcCandidateTable(previewCandidates, sourceCandidates, filteredCandidates)}
+      ${renderAlcAffectedFilesDetails({
+        activeView,
+        activeDecision,
+        activeRisks,
+        search,
+        filteredCandidates,
+        previewCandidates,
+        sourceCandidates,
+        plannedBytes,
+        totalBytes
+      })}
       ${renderAlcProgressPanel()}
       <div id="alcResult" class="alc-result is-hidden"></div>
       <div class="alc-footer">
@@ -3910,22 +3969,219 @@ function renderAlcModal() {
   `;
 }
 
-function renderAlcSafetyNotice(userContentCount, candidateCount) {
+function renderCleanupHero(plan) {
+  const candidates = getAlcCandidates({
+    applyRiskFilters: false,
+    applyViewFilters: false,
+    applyDecisionFilters: false,
+    applySearchFilters: false,
+    limit: Infinity
+  });
+  const targetPlan = plan?.targetPlan || plan?.summary?.targetPlan;
+  const candidateBytesTotal = candidates.reduce((sum, item) => sum + candidateBytes(item), 0);
+  const plannedBytes = Math.max(activeAlcTargetBytes(plan), candidateBytesTotal);
+  const plannedFiles = Math.max(Number(targetPlan?.selectedFiles || 0), candidates.length);
+  const waves = buildAlcExecutionWaves({
+    files: candidates,
+    plannedBytes,
+    plannedFiles
+  });
+  const audit = alcAuditStatus({
+    targetKind: state.alcDraft.targetKind,
+    targetDirectory: state.alcDraft.targetDirectory,
+    candidates: selectedAlcCandidates()
+  });
+  const volumeInfo = estimateAlcVolumeInfo({
+    rootPath: state.result?.rootPath || elements.rootPath?.value?.trim(),
+    targetKind: state.alcDraft.targetKind,
+    targetDirectory: state.alcDraft.targetDirectory
+  });
+  const status = state.alcProgress
+    ? progressStatusLabel(state.alcProgress)
+    : state.lastAlcReport
+      ? finalReportStatusLabel(state.lastAlcReport)
+      : plannedBytes > 0
+        ? "Plano criado"
+        : "Pronto para analisar";
+  const nextAction = !plannedBytes
+    ? "Varrer"
+    : audit.ready
+      ? "Executar ou simular"
+      : "Simular ou expandir fila";
+
   return `
-    <section class="alc-safety-notice" aria-label="Avisos importantes do A.L.C">
+    <section class="cleanup-hero">
       <div>
-        <strong>Avisos importantes</strong>
-        <p>Arquivos temporarios, caches, logs, instaladores, compactados antigos, downloads e itens de baixo uso podem ser movidos, quarentenados ou enviados para a lixeira quando voce confirmar.</p>
+        <span class="eyebrow">Status</span>
+        <h3>${escapeHtml(status)}</h3>
+        <p class="muted">${escapeHtml(nextAction)}</p>
       </div>
-      <ul>
-        <li>Revise documentos, fotos, videos, projetos, saves, backups e qualquer pasta sincronizada antes de executar.</li>
-        <li>E recomendado isentar pastas de trabalho, clientes, estudos, repositorios ativos, nuvem e qualquer diretorio que voce nao quer tocar.</li>
-        <li>Quarentena preserva caminho original no manifesto; exclusao permanente nao e o padrao desta tela.</li>
-        <li>Garantia operacional: o A.L.C nao age sozinho; ele respeita isencoes, mostra a fila e so executa depois da sua confirmacao.</li>
-      </ul>
-      <small>${formatNumber(candidateCount)} candidato(s) na fila atual; ${formatNumber(userContentCount)} parecem conteudo do usuario.</small>
+      <div class="cleanup-hero-grid">
+        <span><b>${formatBytes(plannedBytes)}</b><small>plano total</small></span>
+        <span><b>${formatNumber(plannedFiles || candidates.length)}</b><small>arquivos</small></span>
+        <span><b>${formatNumber(waves.total)}</b><small>waves</small></span>
+        <span><b>${audit.ready ? "auditavel" : "pendente"}</b><small>manifesto</small></span>
+      </div>
+      <div class="volume-diagnosis ${volumeInfo.sameVolume === false ? "is-warning" : ""}">
+        ${escapeHtml(volumeInfo.message || "volume nao verificado")}
+      </div>
     </section>
   `;
+}
+
+function renderAlcAffectedFilesDetails({
+  activeView,
+  activeDecision,
+  activeRisks,
+  search,
+  filteredCandidates,
+  previewCandidates,
+  sourceCandidates,
+  plannedBytes,
+  totalBytes
+}) {
+  return `
+    <details class="alc-technical-details">
+      <summary>Arquivos afetados e filtros</summary>
+      ${renderExemptionManager()}
+      <div class="alc-tab-row" role="tablist" aria-label="Visao">
+        <button class="mode-button${activeView === "all" ? " is-active" : ""}" type="button" data-alc-view="all">Todos</button>
+        <button class="mode-button${activeView === "user" ? " is-active" : ""}" type="button" data-alc-view="user">Usuario</button>
+      </div>
+      <div class="alc-filter-grid">
+        <label class="field">
+          <span>Buscar</span>
+          <input id="alcSearch" type="search" spellcheck="false" placeholder="nome" value="${escapeHtml(search)}">
+        </label>
+        <label class="field">
+          <span>Decisao</span>
+          <select id="alcDecisionFilter">
+            <option value="all"${activeDecision === "all" ? " selected" : ""}>Todas</option>
+            <option value="pode_apagar"${activeDecision === "pode_apagar" ? " selected" : ""}>Pode apagar</option>
+            <option value="inutil_provavel"${activeDecision === "inutil_provavel" ? " selected" : ""}>Inutil provavel</option>
+            <option value="averiguar"${activeDecision === "averiguar" ? " selected" : ""}>Averiguar</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>Risco</span>
+          <div class="alc-risk-filter">
+            ${["baixo", "medio", "alto", "critico"].map((risk) => `
+              <label>
+                <input type="checkbox" data-alc-risk-filter="${escapeHtml(risk)}"${activeRisks.includes(risk) ? " checked" : ""}>
+                <span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span>
+              </label>
+            `).join("")}
+          </div>
+        </div>
+      </div>
+      ${renderAlcMiniExplorer(filteredCandidates, plannedBytes, totalBytes)}
+      ${renderAlcCandidateTable(previewCandidates, sourceCandidates, filteredCandidates)}
+    </details>
+  `;
+}
+
+function renderAlcSafetyNotice(userContentCount, candidateCount) {
+  return `
+    <details class="alc-safety-notice" aria-label="Avisos importantes do A.L.C">
+      <summary>Avisos</summary>
+      <p>Revise conteudo pessoal, projetos, saves, backups e nuvem antes de executar.</p>
+      <ul>
+        <li>Quarentena preserva caminho original no manifesto.</li>
+        <li>A execucao usa o plano auditavel inteiro, nao a amostra visivel.</li>
+        <li>Pastas isentas e decisoes manuais continuam valendo.</li>
+      </ul>
+      <small>${formatNumber(candidateCount)} candidato(s) na fila atual; ${formatNumber(userContentCount)} parecem conteudo do usuario.</small>
+    </details>
+  `;
+}
+
+function buildAlcExecutionWaves({ files = [], plannedBytes = 0, plannedFiles = 0, waveBytes = ALC_DEFAULT_WAVE_BYTES } = {}) {
+  const normalizedWaveBytes = Math.max(1, Number(waveBytes || ALC_DEFAULT_WAVE_BYTES));
+  const waves = [];
+  let current = { index: 1, files: 0, bytes: 0 };
+  for (const file of files) {
+    const bytes = Math.max(0, candidateBytes(file));
+    if (current.files > 0 && (current.bytes + bytes > normalizedWaveBytes || current.files >= ALC_MAX_WAVE_FILES)) {
+      waves.push(current);
+      current = { index: waves.length + 1, files: 0, bytes: 0 };
+    }
+    current.files += 1;
+    current.bytes += bytes;
+  }
+  if (current.files > 0 || !waves.length) {
+    waves.push(current);
+  }
+  const estimatedByBytes = Math.max(1, Math.ceil(Number(plannedBytes || 0) / normalizedWaveBytes));
+  const total = Math.max(waves.length, estimatedByBytes);
+  return {
+    total,
+    waveBytes: normalizedWaveBytes,
+    plannedBytes: Number(plannedBytes || 0),
+    plannedFiles: Number(plannedFiles || files.length || 0),
+    waves
+  };
+}
+
+function renderAlcWaveBoard(waves, plannedBytes) {
+  const sourceLabel = waves.plannedBytes > waves.waves.reduce((sum, wave) => sum + wave.bytes, 0) * 1.02
+    ? "plano total do A.R.E"
+    : "lista auditavel";
+  return `
+    <section class="wave-board">
+      <div>
+        <span class="eyebrow">Waves</span>
+        <strong>${formatNumber(waves.total)} bloco(s)</strong>
+        <small>${escapeHtml(sourceLabel)} como fonte</small>
+      </div>
+      <div class="wave-board-grid">
+        <span><b>${formatBytes(plannedBytes || waves.plannedBytes)}</b><small>plano total</small></span>
+        <span><b>${formatBytes(waves.waveBytes)}</b><small>por wave</small></span>
+        <span><b>${formatNumber(waves.plannedFiles)}</b><small>arquivos planejados</small></span>
+      </div>
+    </section>
+  `;
+}
+
+function currentAlcWaveInfo(progress = {}, waveBytes = ALC_DEFAULT_WAVE_BYTES) {
+  const targetBytes = Math.max(0, Number(progress.targetBytes || progress.plannedBytes || 0));
+  const movedBytes = Math.max(0, Number(progress.movedBytes || 0));
+  const normalizedWaveBytes = Math.max(1, Number(progress.waveBytes || waveBytes || ALC_DEFAULT_WAVE_BYTES));
+  const totalWaves = Math.max(1, Number(progress.waveCount || Math.ceil(targetBytes / normalizedWaveBytes) || 1));
+  const cappedMoved = Math.min(movedBytes, targetBytes || movedBytes);
+  const waveIndex = cappedMoved >= targetBytes && targetBytes > 0
+    ? totalWaves
+    : Math.min(totalWaves, Math.floor(cappedMoved / normalizedWaveBytes) + 1);
+  const waveStart = (waveIndex - 1) * normalizedWaveBytes;
+  const waveTarget = targetBytes > 0
+    ? Math.max(0, Math.min(normalizedWaveBytes, targetBytes - waveStart))
+    : normalizedWaveBytes;
+  const waveMoved = targetBytes > 0 && cappedMoved >= targetBytes
+    ? waveTarget
+    : Math.max(0, Math.min(waveTarget, cappedMoved - waveStart));
+  const wavePercent = waveTarget > 0 ? (waveMoved / waveTarget) * 100 : 0;
+  return {
+    totalWaves,
+    waveIndex,
+    waveMoved,
+    waveTarget,
+    wavePercent: clamp(wavePercent, 0, 100)
+  };
+}
+
+function progressStatusLabel(progress = {}) {
+  if (progress.cancelled) return "Cancelado com seguranca";
+  if (progress.phase === "done") return "Concluido";
+  if (progress.phase === "dry-run") return "Simulando";
+  if (state.alcCancelRequested) return "Cancelando com seguranca";
+  if (progress.phase === "start") return "Preparando execucao";
+  return "Executando";
+}
+
+function finalReportStatusLabel(report = {}) {
+  if (report.cancelled) return "Cancelado com seguranca";
+  if (report.failedFiles > 0) return "Concluido com avisos";
+  if (report.dryRun) return "Simulacao concluida";
+  return "Concluido";
 }
 
 function renderRelocationTargetControls(plan) {
@@ -4228,6 +4484,7 @@ function renderAlcProgressPanel() {
   const hidden = progress ? "" : " is-hidden";
   const percent = clamp(Number(progress?.percent || 0), 0, 100);
   const current = progress?.currentFile || "";
+  const waveInfo = currentAlcWaveInfo(progress || {});
   const phase = progress?.cancelled
     ? "Cancelado"
     : progress?.phase === "done"
@@ -4249,6 +4506,15 @@ function renderAlcProgressPanel() {
       <div class="progress-track" aria-label="A.L.C">
         <span id="alcProgressBar" class="progress-fill" style="width: ${percent}%"></span>
       </div>
+      <div class="alc-wave-progress">
+        <div class="progress-row">
+          <span id="alcWaveLabel">Wave ${formatNumber(waveInfo.waveIndex)} de ${formatNumber(waveInfo.totalWaves)}</span>
+          <span id="alcWaveBytes">${formatBytes(waveInfo.waveMoved)} / ${formatBytes(waveInfo.waveTarget)}</span>
+        </div>
+        <div class="progress-track" aria-label="Wave atual">
+          <span id="alcWaveBar" class="progress-fill" style="width: ${waveInfo.wavePercent}%"></span>
+        </div>
+      </div>
       <div class="alc-progress-metrics">
         <span><b id="alcProgressFiles">${formatNumber(progress?.movedFiles || 0)} / ${formatNumber(progress?.total || 0)}</b><small>arquivos</small></span>
         <span><b id="alcProgressElapsed">${formatDurationSeconds(progress?.elapsedSeconds || 0)}</b><small>decorrido</small></span>
@@ -4262,12 +4528,13 @@ function renderAlcProgressPanel() {
 }
 
 function updateAlcProgressPanel() {
-  const panel = elements.alcModalBody?.querySelector("#alcProgress");
+  const panel = activeAlcControlRoot()?.querySelector("#alcProgress");
   if (!panel || !state.alcProgress) {
     return;
   }
   const progress = state.alcProgress;
   const percent = clamp(Number(progress.percent || 0), 0, 100);
+  const waveInfo = currentAlcWaveInfo(progress);
   panel.classList.remove("is-hidden");
   const percentElement = panel.querySelector("#alcProgressPercent");
   const phaseElement = panel.querySelector("#alcProgressPhase");
@@ -4279,6 +4546,9 @@ function updateAlcProgressPanel() {
   const elapsedMetric = panel.querySelector("#alcProgressElapsed");
   const etaMetric = panel.querySelector("#alcProgressEta");
   const speedMetric = panel.querySelector("#alcProgressSpeed");
+  const waveLabel = panel.querySelector("#alcWaveLabel");
+  const waveBytes = panel.querySelector("#alcWaveBytes");
+  const waveBar = panel.querySelector("#alcWaveBar");
   const elapsedSeconds = state.alcProgressStartedAt ? (performance.now() - state.alcProgressStartedAt) / 1000 : 0;
   const speed = elapsedSeconds > 0 ? Number(progress.movedBytes || 0) / elapsedSeconds : 0;
   const eta = percent > 0 && percent < 100 ? elapsedSeconds * ((100 - percent) / percent) : 0;
@@ -4295,6 +4565,9 @@ function updateAlcProgressPanel() {
       : "Movendo";
   }
   if (bar) bar.style.width = `${percent}%`;
+  if (waveLabel) waveLabel.textContent = `Wave ${formatNumber(waveInfo.waveIndex)} de ${formatNumber(waveInfo.totalWaves)}`;
+  if (waveBytes) waveBytes.textContent = `${formatBytes(waveInfo.waveMoved)} / ${formatBytes(waveInfo.waveTarget)}`;
+  if (waveBar) waveBar.style.width = `${waveInfo.wavePercent}%`;
   if (bytes) bytes.textContent = `${progress.movedHuman || formatBytes(progress.movedBytes || 0)} / ${progress.targetHuman || formatBytes(progress.targetBytes || 0)}`;
   if (file) file.textContent = progress.currentFile || "-";
   if (filesMetric) filesMetric.textContent = `${formatNumber(progress.movedFiles || 0)} / ${formatNumber(progress.total || 0)}`;
@@ -4341,6 +4614,9 @@ function normalizeAlcProgress(progress = {}) {
     movedHuman: progress.movedHuman || formatBytes(progress.movedBytes || 0),
     targetBytes: Number(progress.targetBytes || 0),
     targetHuman: progress.targetHuman || formatBytes(progress.targetBytes || 0),
+    waveBytes: Number(progress.waveBytes || ALC_DEFAULT_WAVE_BYTES),
+    waveCount: Number(progress.waveCount || 0),
+    waveIndex: Number(progress.waveIndex || 0),
     cancelled: Boolean(progress.cancelled)
   };
 }
@@ -4370,14 +4646,14 @@ async function openLocalPath(targetPath) {
   }
 }
 
-function wireAlcModalControls() {
-  const body = elements.alcModalBody;
+function wireAlcModalControls(root = null) {
+  const body = activeAlcControlRoot(root);
   if (!body) {
     return;
   }
 
   const destinationInput = body.querySelector("#alcDestinationPath");
-  const executeBody = elements.alcModalBody || body;
+  const executeBody = body;
   const executeButton = executeBody.querySelector("#executeAlcButton");
   const simulateButton = executeBody.querySelector("#simulateAlcButton");
   const cancelButton = executeBody.querySelector("#cancelAlcButton");
@@ -4557,11 +4833,17 @@ function wireAlcModalControls() {
 }
 
 function refreshAlcModal() {
-  if (!elements.alcModalBody || elements.alcModal?.classList.contains("is-hidden")) {
+  if (!state.result?.relocationPlan) {
     return;
   }
-  elements.alcModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
-  wireAlcModalControls();
+  if (elements.relocationPanelHost) {
+    elements.relocationPanelHost.innerHTML = renderRelocationPanel(state.result.relocationPlan);
+    wireAlcModalControls(elements.relocationPanelHost);
+  }
+  if (elements.alcModalBody && !elements.alcModal?.classList.contains("is-hidden")) {
+    elements.alcModalBody.innerHTML = renderRelocationPanel(state.result.relocationPlan);
+    wireAlcModalControls(elements.alcModalBody);
+  }
 }
 
 function currentAlcAreMode() {
@@ -5004,55 +5286,63 @@ function windowsVolumeRoot(value) {
   return unc ? unc[0].toLowerCase() : "";
 }
 
-async function showRelocationDelayWarningIfNeeded({ bytes, files, volumeInfo }) {
-  if (localStorage.getItem("maidspace:skip-relocation-delay-warning") === "true") {
-    return true;
-  }
-  const manyBytes = Number(bytes || 0) >= 5 * 1024 * 1024 * 1024;
-  const manyFiles = Number(files || 0) >= 1000;
-  const slowVolume = volumeInfo?.sameVolume === false || volumeInfo?.known === false;
-  if (!manyBytes && !manyFiles && !slowVolume) {
-    return true;
-  }
-  return showRelocationDelayDialog({ bytes, files, volumeInfo });
-}
-
-function showRelocationDelayDialog({ bytes, files, volumeInfo }) {
+function showRelocationExecutionConfirmation({
+  actionLabel,
+  bytes,
+  files,
+  targetKind,
+  targetDirectory,
+  volumeInfo,
+  waves,
+  userContentCount,
+  exemptions,
+  audit,
+  executeByPlan,
+  planMode
+}) {
   if (typeof document === "undefined" || !document.body) {
-    return Promise.resolve(window.confirm("Esta relocacao pode demorar. Continuar?"));
+    return Promise.resolve(true);
   }
+  const destination = targetKind === "directory"
+    ? targetDirectory || "-"
+    : targetKind === "quarantine" || targetKind === "delete"
+      ? "Quarentena MaidSpace"
+      : "Lixeira";
+  const auditLabel = audit?.ready
+    ? `${audit.source === "simulation" ? "simulacao" : "expansao"}: ${formatNumber(audit.itemCount)} item(ns)`
+    : executeByPlan
+      ? `pendente para ${modeLabel(planMode)}`
+      : "lista direta";
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
     overlay.className = "runtime-dialog-backdrop";
     overlay.innerHTML = `
-      <section class="runtime-dialog" role="dialog" aria-modal="true" aria-labelledby="relocationDelayTitle">
-        <h2 id="relocationDelayTitle">Relocacao pode demorar</h2>
-        <p>Esta relocacao pode demorar, especialmente se os arquivos forem movidos entre discos ou particoes diferentes. O MaidSpace continuara mostrando o progresso durante a operacao.</p>
+      <section class="runtime-dialog execution-confirmation" role="dialog" aria-modal="true" aria-labelledby="relocationExecuteTitle">
+        <h2 id="relocationExecuteTitle">Relocacao pronta</h2>
+        <p>Esta operacao pode demorar, especialmente entre discos ou particoes diferentes. O MaidSpace executara o plano em waves e mostrara o progresso total.</p>
         <dl>
+          <dt>Acao</dt><dd>${escapeHtml(actionLabel)}</dd>
+          <dt>Total</dt><dd>${formatBytes(bytes || 0)} / ${formatNumber(files || 0)} arquivo(s)</dd>
+          <dt>Destino</dt><dd>${escapeHtml(destination)}</dd>
+          <dt>Waves</dt><dd>${formatNumber(waves?.total || 1)} de ate ${formatBytes(waves?.waveBytes || ALC_DEFAULT_WAVE_BYTES)}</dd>
           <dt>Volume</dt><dd>${escapeHtml(volumeInfo?.message || "nao verificado")}</dd>
-          <dt>Arquivos</dt><dd>${formatNumber(files || 0)}</dd>
-          <dt>Dados</dt><dd>${formatBytes(bytes || 0)}</dd>
+          <dt>Manifesto</dt><dd>${escapeHtml(auditLabel)}</dd>
         </dl>
-        <label class="runtime-dialog-check">
-          <input id="skipRelocationDelayWarning" type="checkbox">
-          <span>Nao mostrar novamente</span>
-        </label>
+        ${userContentCount ? `<p class="runtime-warning">Atencao: ${formatNumber(userContentCount)} item(ns) parecem conteudo do usuario.</p>` : ""}
+        ${targetKind === "delete" ? `<p class="runtime-warning">Exclusao permanente nao e o padrao; sem confirmacao explicita, o MaidSpace usa quarentena.</p>` : ""}
+        <p class="muted">${formatNumber(exemptions || 0)} pasta(s) isenta(s). A lista visivel pode ser amostra; a execucao usa o plano auditavel completo.</p>
         <div class="runtime-dialog-actions">
-          <button id="cancelRelocationDelay" class="ghost-button" type="button">Voltar</button>
-          <button id="continueRelocationDelay" class="primary-button" type="button">Continuar</button>
+          <button id="cancelRelocationExecution" class="ghost-button" type="button">Voltar</button>
+          <button id="continueRelocationExecution" class="primary-button" type="button">Executar</button>
         </div>
       </section>
     `;
     const finish = (accepted) => {
-      const skip = overlay.querySelector("#skipRelocationDelayWarning")?.checked;
-      if (skip) {
-        localStorage.setItem("maidspace:skip-relocation-delay-warning", "true");
-      }
       overlay.remove();
       resolve(accepted);
     };
-    overlay.querySelector("#cancelRelocationDelay")?.addEventListener("click", () => finish(false));
-    overlay.querySelector("#continueRelocationDelay")?.addEventListener("click", () => finish(true));
+    overlay.querySelector("#cancelRelocationExecution")?.addEventListener("click", () => finish(false));
+    overlay.querySelector("#continueRelocationExecution")?.addEventListener("click", () => finish(true));
     overlay.addEventListener("click", (event) => {
       if (event.target === overlay) {
         finish(false);
@@ -5063,7 +5353,7 @@ function showRelocationDelayDialog({ bytes, files, volumeInfo }) {
 }
 
 async function runAlcRelocation({ dryRun = false } = {}) {
-  const body = elements.alcModalBody;
+  const body = activeAlcControlRoot();
   if (!body) {
     return;
   }
@@ -5100,6 +5390,11 @@ async function runAlcRelocation({ dryRun = false } = {}) {
   const executeByPlan = alcExecutionFiltersAreBroad() && Boolean(planTargetBytes && selectedBytes < planTargetBytes * 0.98);
   const audit = alcAuditStatus({ targetKind, targetDirectory, candidates });
   const confirmationBytes = selectedBytes || planTargetBytes;
+  const wavePlan = buildAlcExecutionWaves({
+    files: candidates,
+    plannedBytes: confirmationBytes,
+    plannedFiles: candidates.length
+  });
 
   if (!candidates.length) {
     showAlcResult(null, new Error("Selecione pelo menos um arquivo."));
@@ -5123,40 +5418,27 @@ async function runAlcRelocation({ dryRun = false } = {}) {
     : targetKind === "trash"
       ? "enviar para a lixeira"
       : "mover para o destino";
-  const destructiveWarning = targetKind === "delete"
-    ? "\n- Excluir e definitivo: os arquivos nao vao para a lixeira e o espaco e liberado imediatamente."
-    : "";
-  const importantTypesWarning = [
-    "ATENCAO IMPORTANTE:",
-    "- Podem sair da pasta: temporarios, caches, logs, instaladores, compactados antigos, downloads e arquivos grandes/pouco usados.",
-    "- Revise com cuidado: documentos, fotos, videos, projetos, backups, saves e pastas sincronizadas.",
-    "- Recomendado: isente pastas pessoais ou de trabalho antes de continuar.",
-    `- Garantia operacional: o A.L.C so executa apos esta confirmacao e respeita as isencoes salvas.${destructiveWarning}`
-  ].join("\n");
-  const warning = userContentCount
-    ? `\n\n${userContentCount} arquivo(s) parecem conteudo criado pelo usuario.`
-    : "";
   const exemptions = Object.keys(state.preferences.exemptDirectories || {}).length;
-  const planWarning = executeByPlan && !audit.ready
-    ? `\n\nO A.L.C precisa de uma lista auditavel para o plano ${modeLabel(planMode)} antes da execucao real.`
-    : executeByPlan && audit.ready
-      ? `\n\nLista auditavel reconhecida via ${audit.source === "simulation" ? "simulacao" : "expansao"}: ${formatNumber(audit.itemCount)} item(ns).`
-    : "";
   if (!dryRun) {
     const volumeInfo = estimateAlcVolumeInfo({
       rootPath: state.result.rootPath || elements.rootPath.value.trim(),
       targetKind,
       targetDirectory
     });
-    const canContinue = await showRelocationDelayWarningIfNeeded({
+    const confirmed = await showRelocationExecutionConfirmation({
+      actionLabel,
       bytes: confirmationBytes,
       files: candidates.length,
-      volumeInfo
+      targetKind,
+      targetDirectory,
+      volumeInfo,
+      waves: wavePlan,
+      userContentCount,
+      exemptions,
+      audit,
+      executeByPlan,
+      planMode
     });
-    if (!canContinue) {
-      return;
-    }
-    const confirmed = window.confirm(`${importantTypesWarning}\n\nConfirmar A.L.C para ${actionLabel} ${executeByPlan ? "o plano A.R.E" : `${candidates.length} arquivo(s)`}, somando aproximadamente ${formatBytes(confirmationBytes)}?\n\nPastas isentas: ${exemptions}.${warning}${planWarning}`);
     if (!confirmed) {
       return;
     }
@@ -5174,7 +5456,10 @@ async function runAlcRelocation({ dryRun = false } = {}) {
     percent: 0,
     currentFile: "",
     movedBytes: 0,
-    targetBytes: confirmationBytes
+    targetBytes: confirmationBytes,
+    waveBytes: wavePlan.waveBytes,
+    waveCount: wavePlan.total,
+    waveIndex: 1
   });
   await startAlcProgressListener();
   updateAlcProgressPanel();
@@ -5188,6 +5473,8 @@ async function runAlcRelocation({ dryRun = false } = {}) {
       targetDirectory,
       planMode,
       targetBytes: confirmationBytes,
+      waveBytes: wavePlan.waveBytes,
+      plannedWaveCount: wavePlan.total,
       expandPlan: false,
       dryRun,
       auditSource: dryRun ? "simulation" : audit.ready ? audit.source : "direct",
@@ -5223,6 +5510,8 @@ async function runAlcRelocation({ dryRun = false } = {}) {
       failedFiles: report.failedFiles || 0,
       skippedFiles: report.skippedFiles || 0,
       cancelledFiles: report.cancelledFiles || 0,
+      waveBytes: report.waveBytes || wavePlan.waveBytes,
+      waveCount: report.waveCount || wavePlan.total,
       cancelled: Boolean(report.cancelled)
     });
     updateAlcProgressPanel();
@@ -5230,6 +5519,7 @@ async function runAlcRelocation({ dryRun = false } = {}) {
       ? `A.L.C simulado: ${formatNumber(report.plannedFiles || report.operations?.length || 0)} item(ns), manifesto ${report.manifestPath || "gerado"}.`
       : `A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
     appendSystemLog(`A.L.C auditoria: ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns), manifesto ${report.manifestPath || "gerado"}.`);
+    appendSystemLog(`A.L.C plano fonte: ${formatNumber(report.plannedFiles || candidates.length)} item(ns), ${formatNumber(report.waveCount || wavePlan.total)} wave(s); log visivel e resumo, nao fila.`);
     if (report.volumeInfo?.message) {
       appendSystemLog(`A.L.C volume: ${report.volumeInfo.message}.`);
     }
@@ -5251,7 +5541,7 @@ async function runAlcRelocation({ dryRun = false } = {}) {
 }
 
 function showAlcResult(report, error = null) {
-  const result = elements.alcModalBody?.querySelector("#alcResult");
+  const result = activeAlcControlRoot()?.querySelector("#alcResult");
   if (!result) {
     return;
   }
@@ -5269,6 +5559,7 @@ function showAlcResult(report, error = null) {
     result.innerHTML = `
       <strong>Cancelado</strong>
       <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${alcReportActionLabel(report)}, ${formatBytes(report.movedBytes || 0)}.</span>
+      <span>Waves: ${formatNumber(report.wavesCompleted || 0)} de ${formatNumber(report.waveCount || 1)}.</span>
       <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s).</span>
       <span>Manifesto parcial: ${escapeHtml(report.manifestUsedPath || report.finalManifestPath || report.manifestPath || "-")}.</span>
     `;
@@ -5279,6 +5570,7 @@ function showAlcResult(report, error = null) {
     result.innerHTML = `
       <strong>Simulacao gerada</strong>
       <span>${formatNumber(report.plannedFiles || 0)} item(ns), ${formatBytes(report.plannedBytes || 0)} planejados. Nada foi movido ou apagado.</span>
+      <span>Waves planejadas: ${formatNumber(report.waveCount || 1)}.</span>
       <span>Manifesto: ${escapeHtml(report.finalManifestPath || report.manifestPath || "-")}</span>
       <span>Auditavel: ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns).</span>
     `;
@@ -5297,6 +5589,7 @@ function showAlcResult(report, error = null) {
   result.innerHTML = `
     <strong>A.L.C concluido</strong>
     <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${actionLabel}, ${formatBytes(report.movedBytes || 0)} ${spaceLabel}.</span>
+    <span>Waves: ${formatNumber(report.wavesCompleted || report.waveCount || 1)} de ${formatNumber(report.waveCount || 1)}.</span>
     <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o A.D.D/A.R.E.</span>
     <span>Manifesto: ${escapeHtml(report.manifestUsedPath || report.finalManifestPath || report.manifestPath || "-")} · ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns) auditaveis.</span>
   `;
@@ -5317,7 +5610,7 @@ function alcReportActionLabel(report) {
 }
 
 function refreshAlcReportButtons() {
-  const body = elements.alcModalBody;
+  const body = activeAlcControlRoot();
   if (!body) {
     return;
   }

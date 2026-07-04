@@ -40,6 +40,8 @@ const {
 
 const rootDirectory = __dirname;
 const publicDirectory = path.join(rootDirectory, "public");
+const DEFAULT_ALC_WAVE_BYTES = 50 * 1024 * 1024 * 1024;
+const MAX_ALC_WAVE_FILES = 5000;
 
 function createAppServer() {
   return http.createServer(async (request, response) => {
@@ -299,6 +301,10 @@ async function executeAlcRelocationServer(request = {}) {
     cancelled: false,
     plannedBytes: 0,
     movedBytes: 0,
+    waveBytes: Math.max(1, Number(request.waveBytes || DEFAULT_ALC_WAVE_BYTES)),
+    waveCount: Math.max(1, Number(request.plannedWaveCount || 1)),
+    wavesCompleted: 0,
+    waves: [],
     stageTimings: {},
     operations: [],
     progress: {
@@ -358,6 +364,14 @@ async function executeAlcRelocationServer(request = {}) {
     ...prepared.operation,
     status: "planned"
   }));
+  const wavePlan = buildAlcExecutionWavesFromOperations(plannedOperations, {
+    waveBytes: report.waveBytes,
+    plannedBytes: Math.max(report.plannedBytes, targetBytes),
+    plannedFiles: report.plannedFiles
+  });
+  report.waveBytes = wavePlan.waveBytes;
+  report.waveCount = wavePlan.total;
+  report.waves = wavePlan.waves;
   const manifest = createOperationManifest({
     operationId,
     dryRun,
@@ -383,6 +397,7 @@ async function executeAlcRelocationServer(request = {}) {
     report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
     report.manifestUsedPath = report.finalManifestPath || report.manifestPath;
     report.auditedItemCount = report.plannedFiles;
+    report.wavesCompleted = 0;
     report.stageTimings = buildAlcStageTimings({
       planningSeconds,
       executionSeconds: 0,
@@ -416,6 +431,9 @@ async function executeAlcRelocationServer(request = {}) {
   report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
   report.manifestUsedPath = report.finalManifestPath || report.manifestPath;
   report.auditedItemCount = report.plannedFiles;
+  report.wavesCompleted = report.cancelled
+    ? completedAlcWaves(report.movedBytes, report.waveBytes, report.waveCount)
+    : report.waveCount;
   report.stageTimings = buildAlcStageTimings({
     planningSeconds,
     executionSeconds,
@@ -440,6 +458,40 @@ function buildAlcStageTimings({ planningSeconds, executionSeconds, loggingSecond
     logging: loggingSeconds,
     total: totalSeconds
   };
+}
+
+function buildAlcExecutionWavesFromOperations(operations = [], options = {}) {
+  const waveBytes = Math.max(1, Number(options.waveBytes || DEFAULT_ALC_WAVE_BYTES));
+  const plannedBytes = Math.max(0, Number(options.plannedBytes || 0));
+  const plannedFiles = Math.max(0, Number(options.plannedFiles || operations.length || 0));
+  const waves = [];
+  let current = { index: 1, files: 0, bytes: 0 };
+  for (const operation of operations) {
+    const bytes = Math.max(0, Number(operation.sizeBytes || operation.size || 0));
+    if (current.files > 0 && (current.bytes + bytes > waveBytes || current.files >= MAX_ALC_WAVE_FILES)) {
+      waves.push(current);
+      current = { index: waves.length + 1, files: 0, bytes: 0 };
+    }
+    current.files += 1;
+    current.bytes += bytes;
+  }
+  if (current.files > 0 || !waves.length) {
+    waves.push(current);
+  }
+  const estimatedByBytes = Math.max(1, Math.ceil(plannedBytes / waveBytes));
+  const total = Math.max(waves.length, estimatedByBytes);
+  return {
+    total,
+    waveBytes,
+    plannedBytes,
+    plannedFiles,
+    waves
+  };
+}
+
+function completedAlcWaves(movedBytes, waveBytes, waveCount) {
+  const completed = Math.floor(Math.max(0, Number(movedBytes || 0)) / Math.max(1, Number(waveBytes || DEFAULT_ALC_WAVE_BYTES)));
+  return Math.max(0, Math.min(Number(waveCount || 1), completed));
 }
 
 function volumeInfoForRelocation(root, targetDirectory) {

@@ -18,6 +18,7 @@
         </div>
         <div class="header-actions">
           <span id="serverStatus" class="status-pill">...</span>
+          <button id="helpButton" class="ghost-button" type="button">Como usar</button>
           <button id="exportButton" class="ghost-button" type="button" disabled title="Exportar relatorio JSON">
             <span aria-hidden="true">⇩</span>
             JSON
@@ -110,7 +111,13 @@
         </section>
       </aside>
 
-      <main class="graph-workbench">
+      <main class="graph-workbench release-workbench">
+        <section class="workspace-heading map-workspace-heading" aria-label="Mapa e dependencias">
+          <div>
+            <span class="eyebrow">Mapa / Dependencias</span>
+            <h2>O que existe aqui</h2>
+          </div>
+        </section>
         <section class="metrics-strip" id="metrics" aria-label="Resumo do relatorio"></section>
 
         <section class="graph-stage graph-lens" aria-label="Grafo de dependencias">
@@ -139,14 +146,22 @@
           <div id="simulationGrid" class="decision-grid"></div>
         </section>
 
+        <section class="workspace-heading cleanup-workspace-heading" aria-label="Relocacao e limpeza">
+          <div>
+            <span class="eyebrow">Relocacao / Limpeza</span>
+            <h2>O que sera feito</h2>
+          </div>
+        </section>
+
         <section class="data-dock relocation-dock" aria-label="Painel de Relocação">
           <div class="dock-heading">
             <div>
               <h2>Relocar</h2>
             </div>
-            <button id="openAreModal" class="ghost-button" type="button" disabled>Abrir</button>
+            <button id="openAreModal" class="ghost-button" type="button" disabled>Focar</button>
           </div>
           <div id="areSummary" class="plan-summary"></div>
+          <div id="relocationPanelHost" class="relocation-panel-host"></div>
           <details>
             <summary>Estado A.L.C</summary>
             <div id="continuousState" class="state-grid"></div>

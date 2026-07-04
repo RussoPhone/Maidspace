@@ -537,6 +537,70 @@ button:disabled {
   min-width: 0;
 }
 
+.release-workbench {
+  align-items: start;
+  grid-template-columns: minmax(0, 1.28fr) minmax(360px, 0.72fr);
+}
+
+.workspace-heading {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.workspace-heading .eyebrow,
+.cleanup-hero .eyebrow,
+.wave-board .eyebrow {
+  color: var(--muted);
+  display: block;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.release-workbench .map-workspace-heading,
+.release-workbench .metrics-strip,
+.release-workbench .graph-stage,
+.release-workbench .decision-dock,
+.release-workbench > .data-dock:not(.relocation-dock) {
+  grid-column: 1;
+}
+
+.release-workbench .cleanup-workspace-heading,
+.release-workbench .relocation-dock {
+  grid-column: 2;
+}
+
+.release-workbench .cleanup-workspace-heading {
+  grid-row: 1;
+}
+
+.release-workbench .relocation-dock {
+  align-self: start;
+  display: grid;
+  gap: 10px;
+  grid-row: 2 / span 8;
+  max-height: calc(100vh - 92px);
+  overflow: auto;
+  position: sticky;
+  top: 10px;
+}
+
+.relocation-panel-host {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.focus-pulse {
+  outline: 3px solid rgba(15, 111, 123, 0.34);
+  outline-offset: 3px;
+}
+
 .metrics-strip {
   display: grid;
   gap: 6px;
@@ -916,6 +980,13 @@ summary {
   justify-content: flex-end;
 }
 
+.runtime-warning {
+  background: #fff8e8;
+  border-left: 4px solid var(--medium);
+  color: #3d3321;
+  padding: 8px 10px;
+}
+
 .relocation-modal-panel {
   width: min(1240px, calc(100vw - 32px));
 }
@@ -1075,6 +1146,68 @@ summary {
 .alc-console {
   display: grid;
   gap: 10px;
+}
+
+.cleanup-hero,
+.wave-board {
+  background: #f7fafb;
+  border: 1px solid var(--line-strong);
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.cleanup-hero h3 {
+  font-size: 18px;
+}
+
+.cleanup-hero-grid,
+.wave-board-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.cleanup-hero-grid span,
+.wave-board-grid span {
+  background: #fff;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px;
+}
+
+.cleanup-hero-grid b,
+.wave-board-grid b {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cleanup-hero-grid small,
+.wave-board-grid small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.volume-diagnosis {
+  border-left: 4px solid var(--low);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 7px 9px;
+}
+
+.volume-diagnosis.is-warning {
+  border-color: var(--medium);
+  color: #493719;
+}
+
+.wave-board {
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
 }
 
 .alc-alert {
@@ -1388,6 +1521,33 @@ summary {
   padding: 10px 12px;
 }
 
+.alc-safety-notice summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.alc-safety-notice[open] summary {
+  margin-bottom: 6px;
+}
+
+.alc-technical-details {
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  padding: 9px;
+}
+
+.alc-technical-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.alc-technical-details[open] summary {
+  margin-bottom: 8px;
+}
+
 .alc-preview-board {
   border: 1px solid var(--line-strong);
   border-radius: 8px;
@@ -1454,6 +1614,14 @@ summary {
   display: grid;
   gap: 6px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.alc-wave-progress {
+  background: #fff;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 6px;
+  padding: 8px;
 }
 
 .alc-progress-metrics span {
@@ -1726,6 +1894,26 @@ summary {
   .metrics-strip {
     grid-template-columns: repeat(4, minmax(92px, 1fr));
   }
+
+  .release-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .release-workbench .map-workspace-heading,
+  .release-workbench .metrics-strip,
+  .release-workbench .graph-stage,
+  .release-workbench .decision-dock,
+  .release-workbench .cleanup-workspace-heading,
+  .release-workbench .relocation-dock,
+  .release-workbench > .data-dock:not(.relocation-dock) {
+    grid-column: 1;
+  }
+
+  .release-workbench .relocation-dock {
+    grid-row: auto;
+    max-height: none;
+    position: static;
+  }
 }
 
 @media (max-width: 820px) {
@@ -1751,6 +1939,9 @@ summary {
   .alc-filter-grid,
   .alc-folder-grid,
   .alc-plan-grid,
+  .cleanup-hero-grid,
+  .wave-board,
+  .wave-board-grid,
   .file-map-columns,
   .are-criteria-list {
     grid-template-columns: 1fr;

@@ -30,6 +30,8 @@ struct AlcRelocationRequest {
     audit_manifest_path: Option<String>,
     audited_item_count: Option<usize>,
     audit_fingerprint: Option<String>,
+    wave_bytes: Option<u64>,
+    planned_wave_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +81,9 @@ struct AlcRelocationReport {
     cancelled: bool,
     planned_bytes: u64,
     moved_bytes: u64,
+    wave_bytes: u64,
+    wave_count: usize,
+    waves_completed: usize,
     stage_timings: Value,
     operations: Vec<AlcOperationReport>,
 }
@@ -124,6 +129,7 @@ const ALC_TRASH_BATCH_SIZE: usize = 256;
 const ALC_PROGRESS_FILE_INTERVAL: usize = 64;
 const ALC_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
 const ALC_COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const ALC_DEFAULT_WAVE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 const SCAN_PROGRESS_FILE_INTERVAL: u64 = 128;
 const SCAN_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -1032,6 +1038,8 @@ fn execute_alc_relocation(
         .iter()
         .fold(0u64, |sum, file| sum.saturating_add(file.size.unwrap_or(0)));
     let target_bytes = request.target_bytes.unwrap_or(0);
+    let wave_bytes = request.wave_bytes.unwrap_or(ALC_DEFAULT_WAVE_BYTES).max(1);
+    let requested_wave_count = request.planned_wave_count.unwrap_or(1).max(1);
     let should_expand_plan = false;
 
     let mut report = AlcRelocationReport {
@@ -1064,6 +1072,9 @@ fn execute_alc_relocation(
         cancelled: false,
         planned_bytes: 0,
         moved_bytes: 0,
+        wave_bytes,
+        wave_count: requested_wave_count,
+        waves_completed: 0,
         stage_timings: json!({}),
         operations: Vec::with_capacity(files.len().min(MAX_OPERATION_REPORTS)),
     };
@@ -1190,6 +1201,22 @@ fn execute_alc_relocation(
     }
 
     report.cancelled = report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed);
+    let planned_for_waves = report.planned_bytes.max(progress_target_bytes);
+    let estimated_wave_count = if planned_for_waves == 0 {
+        1
+    } else {
+        (planned_for_waves
+            .saturating_add(report.wave_bytes.saturating_sub(1))
+            / report.wave_bytes) as usize
+    };
+    report.wave_count = report.wave_count.max(estimated_wave_count).max(1);
+    report.waves_completed = if dry_run {
+        0
+    } else if report.cancelled {
+        ((report.moved_bytes / report.wave_bytes) as usize).min(report.wave_count)
+    } else {
+        report.wave_count
+    };
     let execution_seconds = execution_started.elapsed().as_secs_f64();
     let logging_started = Instant::now();
     let final_manifest = operation_manifest_json(
@@ -1847,6 +1874,8 @@ fn emit_alc_progress(
             "movedHuman": format_bytes(report.moved_bytes),
             "targetBytes": target_bytes,
             "targetHuman": format_bytes(target_bytes),
+            "waveBytes": report.wave_bytes,
+            "waveCount": report.wave_count,
             "cancelled": report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed)
         }),
     );
