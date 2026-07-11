@@ -42,6 +42,7 @@ const rootDirectory = __dirname;
 const publicDirectory = path.join(rootDirectory, "public");
 const DEFAULT_ALC_WAVE_BYTES = 50 * 1024 * 1024 * 1024;
 const MAX_ALC_WAVE_FILES = 5000;
+const activeAlcCancellations = new Set();
 
 function createAppServer() {
   return http.createServer(async (request, response) => {
@@ -139,7 +140,12 @@ function createAppServer() {
       }
 
       if (request.method === "POST" && request.url === "/api/alc/cancel") {
-        return sendJson(response, 200, { ok: true, unsupported: true });
+        const body = await readJsonBody(request).catch(() => ({}));
+        const operationId = sanitizeOperationId(body.operationId || body.request?.operationId);
+        if (operationId) {
+          activeAlcCancellations.add(operationId);
+        }
+        return sendJson(response, 200, { ok: true, supported: Boolean(operationId), operationId });
       }
 
       if (request.method === "POST" && request.url === "/api/open-path") {
@@ -268,7 +274,7 @@ async function executeAlcRelocationServer(request = {}) {
     targetKind = "quarantine";
   }
 
-  const operationId = createOperationId();
+  const operationId = sanitizeOperationId(request.operationId) || createOperationId();
   const quarantineDirectory = quarantineDirectoryFor(operationId);
   const effectiveAction = effectiveActionForTargetKind(targetKind, { allowPermanentDelete });
   const targetDirectory = targetKind === "directory"
@@ -301,6 +307,7 @@ async function executeAlcRelocationServer(request = {}) {
     cancelled: false,
     plannedBytes: 0,
     movedBytes: 0,
+    averageBytesPerSecond: 0,
     waveBytes: Math.max(1, Number(request.waveBytes || DEFAULT_ALC_WAVE_BYTES)),
     waveCount: Math.max(1, Number(request.plannedWaveCount || 1)),
     wavesCompleted: 0,
@@ -410,7 +417,13 @@ async function executeAlcRelocationServer(request = {}) {
   }
 
   const executionStartedAt = Date.now();
-  for (const prepared of preparedFiles) {
+  for (let index = 0; index < preparedFiles.length; index += 1) {
+    if (activeAlcCancellations.has(operationId)) {
+      report.cancelled = true;
+      report.cancelledFiles = preparedFiles.length - index;
+      break;
+    }
+    const prepared = preparedFiles[index];
     report.progress.currentFile = prepared.operation.relativePath;
     if (effectiveAction === "delete_permanent") {
       await deletePreparedFileServer(prepared, report, manifest);
@@ -425,8 +438,9 @@ async function executeAlcRelocationServer(request = {}) {
     report.progress.completedBytes = report.movedBytes;
   }
   const executionSeconds = secondsSince(executionStartedAt);
+  report.averageBytesPerSecond = executionSeconds > 0 ? Math.round(report.movedBytes / executionSeconds) : 0;
 
-  manifest.status = report.failedFiles > 0 ? "completed_with_errors" : "completed";
+  manifest.status = report.cancelled ? "cancelled" : report.failedFiles > 0 ? "completed_with_errors" : "completed";
   const loggingStartedAt = Date.now();
   report.finalManifestPath = await writeOperationManifest(manifest, { final: true });
   report.manifestUsedPath = report.finalManifestPath || report.manifestPath;
@@ -442,6 +456,7 @@ async function executeAlcRelocationServer(request = {}) {
     effectiveAction,
     dryRun
   });
+  activeAlcCancellations.delete(operationId);
   return report;
 }
 
@@ -499,6 +514,7 @@ function volumeInfoForRelocation(root, targetDirectory) {
     return {
       known: false,
       sameVolume: null,
+      strategy: "managed",
       sourceRoot: path.parse(root).root || null,
       destinationRoot: null,
       message: "destino gerenciado pelo sistema ou quarentena"
@@ -511,6 +527,7 @@ function volumeInfoForRelocation(root, targetDirectory) {
   return {
     known,
     sameVolume,
+    strategy: sameVolume === true ? "rename" : sameVolume === false ? "copy_then_remove" : "unknown",
     sourceRoot,
     destinationRoot,
     message: !known
@@ -519,6 +536,11 @@ function volumeInfoForRelocation(root, targetDirectory) {
         ? "mesmo volume: move/rename tende a ser rapido"
         : "volumes diferentes: copia e remocao podem demorar mais"
   };
+}
+
+function sanitizeOperationId(value) {
+  const text = String(value || "").trim();
+  return /^[0-9A-Za-z._-]{6,120}$/.test(text) ? text : "";
 }
 
 async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
@@ -632,6 +654,18 @@ async function movePreparedFileServer(prepared, targetDirectory, report, created
   const destination = uniqueDestinationServer(path.join(targetDirectory, prepared.relative));
   const parent = path.dirname(destination);
   try {
+    if (normalizeServerPath(prepared.source) === normalizeServerPath(destination)) {
+      prepared.operation.status = "skipped";
+      prepared.operation.error = "Origem e destino sao iguais.";
+      report.skippedFiles += 1;
+      recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+        status: "skipped",
+        finalPath: prepared.source,
+        error: prepared.operation.error
+      });
+      pushServerOperation(report, prepared.operation);
+      return;
+    }
     if (!createdDirectories.has(parent)) {
       await fs.mkdir(parent, { recursive: true });
       createdDirectories.add(parent);
@@ -686,15 +720,20 @@ async function moveFileServer(source, destination) {
   try {
     await fs.rename(source, destination);
   } catch (renameError) {
-    await fs.copyFile(source, destination);
+    if (renameError?.code && renameError.code !== "EXDEV") {
+      try {
+        await fs.copyFile(source, destination);
+      } catch {
+        throw renameError;
+      }
+    } else {
+      await fs.copyFile(source, destination);
+    }
     try {
       await fs.rm(source, { force: true });
     } catch (removeError) {
       await fs.rm(destination, { force: true }).catch(() => {});
       throw removeError;
-    }
-    if (renameError?.code && renameError.code !== "EXDEV") {
-      return;
     }
   }
 }

@@ -753,6 +753,7 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
     };
 
     const moveReport = await postRelocate({
+      operationId: "test-move-op-1",
       rootPath: root,
       targetKind: "directory",
       targetDirectory: destination,
@@ -769,8 +770,20 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
     assert.equal(moveReport.wavesCompleted, moveReport.waveCount);
     assert.ok(moveReport.manifestUsedPath);
     assert.equal(moveReport.volumeInfo.known, true);
+    assert.ok(["rename", "copy_then_remove", "unknown"].includes(moveReport.volumeInfo.strategy));
+    assert.ok(moveReport.averageBytesPerSecond >= 0);
     await assert.rejects(fs.access(path.join(root, "move-me.txt")));
     await fs.access(path.join(destination, "move-me.txt"));
+
+    const cancelResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operationId: "test-cancel-op-1" })
+    });
+    const cancelPayload = await cancelResponse.json();
+    assert.equal(cancelResponse.ok, true, cancelPayload.error || "falha HTTP");
+    assert.equal(cancelPayload.supported, true);
+    assert.equal(cancelPayload.operationId, "test-cancel-op-1");
 
     const deleteReport = await postRelocate({
       rootPath: root,
