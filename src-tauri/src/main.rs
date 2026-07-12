@@ -1024,6 +1024,16 @@ fn execute_alc_relocation(
             .filter(|path| !path.is_empty())
             .ok_or_else(|| String::from("Escolha uma pasta de destino para a limpeza."))?;
         let target = PathBuf::from(value);
+        let resolved_target = absolute_path(&target)
+            .map_err(|error| format!("Nao foi possivel resolver o destino: {error}"))?;
+        if resolved_target == root || resolved_target.starts_with(&root) {
+            return Err(String::from(
+                "O destino esta dentro da raiz varrida; escolha uma pasta fora dela para liberar espaco.",
+            ));
+        }
+        if let Some(reason) = protected_target_directory_reason(&resolved_target) {
+            return Err(reason);
+        }
         fs::create_dir_all(&target)
             .map_err(|error| format!("Nao foi possivel criar o destino: {error}"))?;
         let canonical = fs::canonicalize(&target)
@@ -1032,6 +1042,9 @@ fn execute_alc_relocation(
             return Err(String::from(
                 "O destino esta dentro da raiz varrida; escolha uma pasta fora dela para liberar espaco.",
             ));
+        }
+        if let Some(reason) = protected_target_directory_reason(&canonical) {
+            return Err(reason);
         }
         Some(canonical)
     } else if let Some(quarantine) = quarantine_root.as_ref() {
@@ -1992,6 +2005,54 @@ fn path_volume_root(path: &Path) -> Option<String> {
     None
 }
 
+fn absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env::current_dir()?.join(path))
+}
+
+fn protected_target_directory_reason(path: &Path) -> Option<String> {
+    let names: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    if names.is_empty() {
+        return Some(String::from("Escolha uma pasta de destino, nao a raiz do volume."));
+    }
+
+    let first = names.first().map(String::as_str).unwrap_or("");
+    let second = names.get(1).map(String::as_str).unwrap_or("");
+    if first == "windows"
+        || first == "program files"
+        || first == "program files (x86)"
+        || first == "system volume information"
+        || first == "$recycle.bin"
+        || (first == "programdata" && second == "microsoft")
+    {
+        return Some(String::from(
+            "Escolha uma pasta de destino fora de diretorios do Windows, programas ou sistema.",
+        ));
+    }
+
+    None
+}
+
+fn is_cross_device_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(17)
+    }
+    #[cfg(not(windows))]
+    {
+        error.raw_os_error() == Some(18)
+    }
+}
+
 fn operation_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2652,6 +2713,9 @@ fn parse_disk_pair(text: &str) -> Result<(u64, u64), String> {
 }
 
 fn safe_relative_path(raw: &str) -> Result<PathBuf, String> {
+    if raw.contains('\0') {
+        return Err(String::from("Caminho invalido."));
+    }
     let path = Path::new(raw);
     if path.is_absolute() {
         return Err(String::from("Caminho absoluto nao e aceito na limpeza."));
@@ -2660,7 +2724,14 @@ fn safe_relative_path(raw: &str) -> Result<PathBuf, String> {
     let mut clean = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => clean.push(part),
+            Component::Normal(part) => {
+                if part.to_string_lossy().contains(':') {
+                    return Err(String::from(
+                        "Caminho com fluxo alternativo ou caractere invalido.",
+                    ));
+                }
+                clean.push(part);
+            }
             Component::CurDir => {}
             _ => return Err(String::from("Caminho relativo inseguro.")),
         }
@@ -2713,6 +2784,9 @@ fn move_file_to(
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
+            if !is_cross_device_error(&rename_error) {
+                return Err(rename_error);
+            }
             copy_file_cancellable(source, destination, on_copy_progress).map_err(|copy_error| {
                 io::Error::new(
                     copy_error.kind(),
@@ -2736,7 +2810,10 @@ fn copy_file_cancellable(
     mut on_progress: Option<&mut dyn FnMut(u64)>,
 ) -> io::Result<u64> {
     let mut input = fs::File::open(source)?;
-    let mut output = fs::File::create(destination)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
     let mut buffer = vec![0u8; ALC_COPY_BUFFER_BYTES];
     let mut written = 0u64;
 

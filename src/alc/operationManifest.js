@@ -86,6 +86,27 @@ function normalizeRelativePath(value) {
   return normalized === "." ? "" : normalized.replace(/^\/+/, "");
 }
 
+function unsafeRelativePathReason(value) {
+  const raw = String(value || "").replace(/\\/g, "/").trim();
+  if (!raw) {
+    return "caminho vazio";
+  }
+  if (raw.includes("\0")) {
+    return "caminho invalido";
+  }
+  if (path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) {
+    return "caminho absoluto nao e aceito";
+  }
+  const parts = raw.split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+    return "caminho relativo inseguro";
+  }
+  if (parts.some((part) => part.includes(":"))) {
+    return "caminho com fluxo alternativo ou caractere invalido";
+  }
+  return null;
+}
+
 function protectedPathReason(relativePath, options = {}) {
   const relative = normalizeRelativePath(relativePath).toLowerCase();
   if (!relative) {
@@ -132,9 +153,11 @@ function effectiveActionForTargetKind(targetKind, options = {}) {
 }
 
 function buildOperationItem(file = {}, context = {}) {
-  const relativePath = normalizeRelativePath(file.relativePath || file.path);
+  const rawRelativePath = file.relativePath || file.path;
+  const relativePath = normalizeRelativePath(rawRelativePath);
   const manualApproval = Boolean(file.manualApproval || file.userApproved || file.userDecision?.action === "relocate");
-  const protectionReason = protectedPathReason(relativePath, { manualApproval });
+  const protectionReason = unsafeRelativePathReason(rawRelativePath)
+    || protectedPathReason(relativePath, { manualApproval });
   const action = protectionReason
     ? "skip"
     : effectiveActionForTargetKind(context.targetKind, {
@@ -275,5 +298,6 @@ module.exports = {
   protectedPathReason,
   quarantineDirectoryFor,
   recordOperationResult,
+  unsafeRelativePathReason,
   writeOperationManifest
 };

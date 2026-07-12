@@ -10,7 +10,8 @@ const {
   buildOperationItem,
   createOperationManifest,
   isProtectedPath,
-  recordOperationResult
+  recordOperationResult,
+  unsafeRelativePathReason
 } = require("../src/alc/operationManifest");
 const { createAppServer, runSrcPipeline, runSrcPipelineProgressive } = require("../server");
 
@@ -652,6 +653,8 @@ test("Limpeza gera manifesto, dry-run e bloqueia caminho protegido", () => {
   assert.equal(isProtectedPath("Windows/System32/kernel32.dll"), true);
   assert.equal(isProtectedPath("Users/me/Documents/tese.pdf"), true);
   assert.equal(isProtectedPath("Users/me/Documents/tese.pdf", { manualApproval: true }), false);
+  assert.equal(unsafeRelativePathReason("../escape.tmp"), "caminho relativo inseguro");
+  assert.equal(unsafeRelativePathReason("cache/file.txt:stream"), "caminho com fluxo alternativo ou caractere invalido");
 
   const item = buildOperationItem({
     relativePath: "cache/old.tmp",
@@ -665,6 +668,19 @@ test("Limpeza gera manifesto, dry-run e bloqueia caminho protegido", () => {
   });
   assert.equal(item.action, "quarantine");
   assert.match(item.plannedDestination, /quarantine/);
+
+  const unsafeItem = buildOperationItem({
+    relativePath: "../escape.tmp",
+    size: 8,
+    risk: "baixo"
+  }, {
+    rootPath: "C:/root",
+    targetKind: "directory",
+    targetDirectory: "D:/dest"
+  });
+  assert.equal(unsafeItem.status, "skipped");
+  assert.equal(unsafeItem.action, "skip");
+  assert.match(unsafeItem.error, /inseguro/);
 
   const manifest = createOperationManifest({
     operationId: "op-test",
@@ -751,6 +767,26 @@ test("Limpeza fallback move e quarentena arquivos via HTTP", async () => {
       assert.equal(response.ok, true, payload.error || "falha HTTP");
       return payload;
     };
+
+    const insideTarget = path.join(root, "destino-interno");
+    const blockedTargetResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/relocate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request: {
+          rootPath: root,
+          targetKind: "directory",
+          targetDirectory: insideTarget,
+          auditSource: "expanded",
+          auditedItemCount: 1,
+          files: [{ relativePath: "move-me.txt" }]
+        }
+      })
+    });
+    const blockedTargetPayload = await blockedTargetResponse.json();
+    assert.equal(blockedTargetResponse.ok, false);
+    assert.match(blockedTargetPayload.error, /dentro da raiz/);
+    await assert.rejects(fs.access(insideTarget));
 
     const moveReport = await postRelocate({
       operationId: "test-move-op-1",

@@ -536,7 +536,7 @@ async function executeAlcRelocationServer(request = {}, runtime = {}) {
   for (let index = 0; index < preparedFiles.length; index += 1) {
     if (activeAlcCancellations.has(operationId)) {
       report.cancelled = true;
-      report.cancelledFiles = preparedFiles.length - index;
+      report.cancelledFiles += preparedFiles.length - index;
       break;
     }
     const prepared = preparedFiles[index];
@@ -554,11 +554,13 @@ async function executeAlcRelocationServer(request = {}, runtime = {}) {
     } else if (effectiveAction === "quarantine") {
       await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, "quarantined", {
         runtime,
+        operationId,
         targetBytes: Math.max(report.plannedBytes, targetBytes)
       });
     } else {
       await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, effectiveAction === "trash" ? "trashed" : "moved", {
         runtime,
+        operationId,
         targetBytes: Math.max(report.plannedBytes, targetBytes)
       });
     }
@@ -725,10 +727,22 @@ async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
   if (!value) {
     throw new Error("Escolha uma pasta de destino para a limpeza.");
   }
+  const resolved = path.resolve(value);
+  if (resolved === root || pathIsInside(resolved, root)) {
+    throw new Error("O destino esta dentro da raiz varrida; escolha uma pasta fora dela para liberar espaco.");
+  }
+  const blockedReason = protectedTargetDirectoryReasonServer(resolved);
+  if (blockedReason) {
+    throw new Error(blockedReason);
+  }
   await fs.mkdir(value, { recursive: true });
   const target = await realpathOrResolve(value);
-  if (pathIsInside(target, root) || target === root) {
+  if (target === root || pathIsInside(target, root)) {
     throw new Error("O destino esta dentro da raiz varrida; escolha uma pasta fora dela para liberar espaco.");
+  }
+  const targetBlockedReason = protectedTargetDirectoryReasonServer(target);
+  if (targetBlockedReason) {
+    throw new Error(targetBlockedReason);
   }
   return target;
 }
@@ -848,6 +862,7 @@ async function movePreparedFileServer(prepared, targetDirectory, report, created
       createdDirectories.add(parent);
     }
     await moveFileServer(prepared.source, destination, {
+      shouldCancel: () => Boolean(progressContext.operationId && activeAlcCancellations.has(progressContext.operationId)),
       onProgress(copiedBytes) {
         const targetBytes = Number(progressContext.targetBytes || report.plannedBytes || 0);
         emitAlcServerProgress(progressContext.runtime, report, {
@@ -869,13 +884,24 @@ async function movePreparedFileServer(prepared, targetDirectory, report, created
       finalPath: destination
     });
   } catch (error) {
-    prepared.operation.status = "error";
-    prepared.operation.error = error.message;
-    report.failedFiles += 1;
-    recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
-      status: "error",
-      error: error.message
-    });
+    if (error.message === "Cancelado." || Boolean(progressContext.operationId && activeAlcCancellations.has(progressContext.operationId))) {
+      prepared.operation.status = "cancelled";
+      prepared.operation.error = "Cancelado.";
+      report.cancelled = true;
+      report.cancelledFiles += 1;
+      recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+        status: "cancelled",
+        error: prepared.operation.error
+      });
+    } else {
+      prepared.operation.status = "error";
+      prepared.operation.error = error.message;
+      report.failedFiles += 1;
+      recordOperationResult(manifest, prepared.operation.id || prepared.operation.relativePath, {
+        status: "error",
+        error: error.message
+      });
+    }
   }
   pushServerOperation(report, prepared.operation);
 }
@@ -908,15 +934,10 @@ async function moveFileServer(source, destination, options = {}) {
   try {
     await fs.rename(source, destination);
   } catch (renameError) {
-    if (renameError?.code && renameError.code !== "EXDEV") {
-      try {
-        await copyFileWithProgressServer(source, destination, options);
-      } catch {
-        throw renameError;
-      }
-    } else {
-      await copyFileWithProgressServer(source, destination, options);
+    if (renameError?.code !== "EXDEV") {
+      throw renameError;
     }
+    await copyFileWithProgressServer(source, destination, options);
     try {
       await fs.rm(source, { force: true });
     } catch (removeError) {
@@ -948,6 +969,10 @@ async function copyFileWithProgressServer(source, destination, options = {}) {
     };
 
     read.on("data", (chunk) => {
+      if (typeof options.shouldCancel === "function" && options.shouldCancel()) {
+        fail(new Error("Cancelado."));
+        return;
+      }
       copiedBytes += chunk.length;
       const now = Date.now();
       if (typeof options.onProgress === "function" && now - lastEmitAt >= 250) {
@@ -976,6 +1001,9 @@ function safeRelativePathServer(rawPath) {
     throw new Error("Caminho vazio.");
   }
   const normalized = String(rawPath).replace(/\\/g, "/");
+  if (normalized.includes("\0")) {
+    throw new Error("Caminho invalido.");
+  }
   if (path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
     throw new Error("Caminho absoluto nao e aceito na limpeza.");
   }
@@ -983,7 +1011,36 @@ function safeRelativePathServer(rawPath) {
   if (!parts.length || parts.some((part) => part === "." || part === "..")) {
     throw new Error("Caminho relativo inseguro.");
   }
+  if (parts.some((part) => part.includes(":"))) {
+    throw new Error("Caminho com fluxo alternativo ou caractere invalido.");
+  }
   return path.join(...parts);
+}
+
+function protectedTargetDirectoryReasonServer(targetDirectory) {
+  const target = path.resolve(targetDirectory);
+  const root = path.parse(target).root;
+  if (target === root) {
+    return "Escolha uma pasta de destino, nao a raiz do volume.";
+  }
+  const relative = normalizeServerPath(path.relative(root, target));
+  if (
+    relative === "windows"
+    || relative.startsWith("windows/")
+    || relative === "program files"
+    || relative.startsWith("program files/")
+    || relative === "program files (x86)"
+    || relative.startsWith("program files (x86)/")
+    || relative === "system volume information"
+    || relative.startsWith("system volume information/")
+    || relative === "$recycle.bin"
+    || relative.startsWith("$recycle.bin/")
+    || relative === "programdata/microsoft"
+    || relative.startsWith("programdata/microsoft/")
+  ) {
+    return "Escolha uma pasta de destino fora de diretorios do Windows, programas ou sistema.";
+  }
+  return null;
 }
 
 function pathIsInside(candidate, root) {
