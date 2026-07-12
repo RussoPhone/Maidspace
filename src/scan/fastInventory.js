@@ -171,7 +171,7 @@ async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onPr
   });
 
   const timer = setTimeout(() => {
-    stopReason = `Expansao A.L.C interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
+    stopReason = `Expansao da limpeza interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
     killProcessTree(child);
   }, maxMs);
 
@@ -198,7 +198,7 @@ async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onPr
           return;
         }
         settled = true;
-        stopReason = stopReason || `Expansao A.L.C forcada a encerrar apos ${maxMs + 5000} ms; candidatos parciais mantidos.`;
+        stopReason = stopReason || `Expansao da limpeza forcada a encerrar apos ${maxMs + 5000} ms; candidatos parciais mantidos.`;
         killProcessTree(child);
         resolve();
       }, maxMs + 5000);
@@ -215,7 +215,7 @@ async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onPr
           buffer = "";
         }
         if (code >= 8 && !stopReason) {
-          stopReason = `Robocopy retornou codigo ${code}; expansao A.L.C parcial mantida.`;
+          stopReason = `Robocopy retornou codigo ${code}; expansao da limpeza parcial mantida.`;
         }
         resolve();
       });
@@ -227,7 +227,7 @@ async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onPr
         settled = true;
         clearTimeout(timer);
         clearTimeout(hardTimer);
-        stopReason = `Falha ao iniciar expansao A.L.C: ${error.message}`;
+        stopReason = `Falha ao iniciar expansao da limpeza: ${error.message}`;
         resolve();
       });
     });
@@ -273,7 +273,7 @@ async function scanRelocationCandidatesWithRobocopy(rootPath, request = {}, onPr
     emitProgress();
     if (state.complete) {
       stopReason = targetBytes
-        ? `Expansao A.L.C atingiu ${formatBytes(state.selectedBytes)} para meta ${formatBytes(targetBytes)}.`
+        ? `Expansao da limpeza atingiu ${formatBytes(state.selectedBytes)} para meta ${formatBytes(targetBytes)}.`
         : null;
       killProcessTree(child);
     }
@@ -321,7 +321,7 @@ async function scanRelocationCandidatesWithFs(rootPath, request = {}, onProgress
 
   while (stack.length && !state.complete) {
     if (Date.now() - startedAt > maxMs) {
-      stopReason = `Expansao A.L.C interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
+      stopReason = `Expansao da limpeza interrompida por limite de ${maxMs} ms; candidatos parciais mantidos.`;
       break;
     }
     const directory = stack.pop();
@@ -1288,7 +1288,7 @@ function rememberFocusedCandidate(state, node) {
 
   if (state.selected.length >= state.maxCandidates) {
     state.complete = true;
-    state.warnings.push(`Expansao A.L.C parou em ${state.maxCandidates} candidato(s).`);
+    state.warnings.push(`Expansao da limpeza parou em ${state.maxCandidates} candidato(s).`);
   } else if (hasTarget && state.selectedBytes >= state.targetBytes) {
     state.complete = true;
   }
@@ -1392,18 +1392,18 @@ function riskForCleanupMode(cleanupMode, node) {
 function justificationForCleanupMode(cleanupMode, node) {
   const knowledge = node.fileKnowledge || {};
   if (cleanupMode === "baixo") {
-    return "inventario A.L.C: cache, temporario ou log de baixo uso";
+    return "inventario de limpeza: cache, temporario ou log de baixo uso";
   }
   if (cleanupMode === "medio") {
-    return "inventario A.L.C: arquivo gerado, pacote ou instalador de baixo uso";
+    return "inventario de limpeza: arquivo gerado, pacote ou instalador de baixo uso";
   }
   if (knowledge.isUserContent || knowledge.isKnownUserFolder || knowledge.isCloudUserContent) {
-    return "inventario A.L.C: conteudo grande ou antigo para revisao";
+    return "inventario de limpeza: conteudo grande ou antigo para revisao";
   }
   if (knowledge.isInstalledApplication) {
-    return "inventario A.L.C: payload pesado de aplicativo/jogo";
+    return "inventario de limpeza: payload pesado de aplicativo/jogo";
   }
-  return "inventario A.L.C: arquivo grande ou pouco usado para revisao";
+  return "inventario de limpeza: arquivo grande ou pouco usado para revisao";
 }
 
 function cleanupModeIncludedIn(selectedMode, cleanupMode) {

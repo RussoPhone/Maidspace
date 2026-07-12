@@ -593,7 +593,7 @@ async function buildAddReportFromCollectedNodes({
 
   return {
     schemaVersion: 1,
-    algorithm: "A.D.D",
+    algorithm: "Grafo",
     rootPath: root,
     options,
     scaleEstimate,
@@ -2744,7 +2744,7 @@ function buildSimulation(fileNodes) {
     decisionGroups,
     recommendation: {
       pode_apagar: "Nao afeta sistema, nao afeta dependencias relevantes e parece fora de uso.",
-      inutil_provavel: "Baixo uso e baixo impacto; bom candidato para A.R.E, mas ainda merece confirmacao.",
+      inutil_provavel: "Baixo uso e baixo impacto; bom candidato para o plano, mas ainda merece confirmacao.",
       averiguar: "Ha uso, dependencia ou incerteza suficiente para pedir revisao.",
       nao_apagar: "Afeta sistema, usuario recente ou dependencia relevante; tratar como protegido."
     }

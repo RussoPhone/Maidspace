@@ -1,42 +1,36 @@
-# Arquitetura alvo do MaidSpace
+# MaidSpace Architecture
 
-## Decisao
+## Pastas principais
 
-MaidSpace e um aplicativo local de armazenamento.
+- `public/`: interface web usada pelo app desktop e pelo servidor local.
+- `server.js`: servidor HTTP local, fallback de scan e jobs de limpeza.
+- `src/add/`: varredura, classificacao e grafo de dependencias.
+- `src/are/`: plano de limpeza e estimativas de espaco.
+- `src/alc/`: preferencias, estado continuo, manifesto e quarentena.
+- `src/scan/`: inventario rapido para expandir candidatos grandes.
+- `src-tauri/`: app desktop Windows e comandos nativos.
+- `tests/`: testes Node do pipeline, manifesto e rotas HTTP.
 
-- **Rust** roda o inventario, classificacao, estimativa de limpeza e futuras leituras NTFS/MFT/USN.
-- **Tauri** entrega uma janela desktop leve e empacotavel.
-- **HTML/CSS/JavaScript** ficam como camada visual para preservar o grafo e iterar rapido.
-- **Node/server** fica apenas como fallback de desenvolvimento.
+## Fluxo de limpeza
 
-## Por que local
+1. A UI coleta raiz, destino, modo e filtros.
+2. O plano gera a lista auditavel de arquivos.
+3. A simulacao cria relatorio sem mover nada.
+4. A execucao real usa o plano auditavel como fonte da verdade.
+5. O log registra resultados; ele nao e fila de execucao.
+6. Arquivos apagados por padrao vao para quarentena.
 
-Limpeza constante precisa rodar perto do sistema de arquivos, observar mudancas enquanto o usuario trabalha e evitar custos de serializar milhoes de arquivos para uma API web. O motor precisa contar tudo, mas detalhar apenas os candidatos relevantes.
+## Progresso
 
-## Contrato de varredura
+- Scan progressivo usa eventos quando o app desktop permite.
+- No servidor local, limpeza real usa `/api/alc/relocate-job`.
+- A UI consulta `/api/alc/jobs/:jobId` para atualizar progresso sem travar.
+- Cancelamento marca a operacao e para antes do proximo arquivo seguro.
 
-O motor deve separar:
+## Regra de manutencao
 
-- inventario completo: arquivos, diretorios, bytes e estimativa por nivel;
-- detalhes compactados: principais candidatos, amostras e grafo navegavel;
-- plano por meta: menor nivel A.R.E que consegue liberar a quantidade desejada;
-- bloqueios: sistema, uso constante, ciclos e dependencias essenciais.
+Mantenha mudancas pequenas. A interface pode mudar, mas a selecao de arquivos e as validacoes de seguranca devem ser alteradas apenas com testes.
 
-## Caminho de performance
+## Leitura complementar
 
-1. Rust walk local como baseline.
-2. Retencao compacta de candidatos por score.
-3. Cache A.L.C para scans incrementais.
-4. Windows: trocar o baseline por leitura NTFS/MFT/USN quando houver permissao adequada.
-5. Execucao assistida e auditavel para limpeza constante.
-
-## Interface
-
-A tela principal deve ser curta e limpa:
-
-- raiz;
-- meta de GB;
-- resumo baixo/medio/alto;
-- plano para bater a meta;
-- botao para abrir detalhes;
-- grafo mantido como visualizacao avancada.
+- [PERFORMANCE.md](PERFORMANCE.md)

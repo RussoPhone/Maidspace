@@ -16,6 +16,7 @@ const state = {
   graphViewCache: new Map(),
   graphViewCacheResult: null,
   graphRenderFrame: 0,
+  panelResizeActive: false,
   scanProgressTimer: null,
   scanProgressStartedAt: 0,
   scanProgressPercent: 0,
@@ -31,6 +32,7 @@ const state = {
   alcProgress: null,
   alcCancelRequested: false,
   alcOperationId: null,
+  alcJobId: null,
   alcProgressUnlisten: null,
   alcFilters: {
     areMode: "target",
@@ -71,9 +73,6 @@ const labels = {
   dependente: "dicente",
   provedor: "docente",
   dependente_provedor: "misto",
-  critico_protegido: "crítico/protegido",
-  diretorio: "diretório"
-  ,
   critico_protegido: "critico/protegido",
   diretorio: "diretorio",
   bloco_interdependente: "bloco interdependente"
@@ -165,8 +164,10 @@ const elements = {
   relocationPanelHost: document.querySelector("#relocationPanelHost"),
   openAreModal: document.querySelector("#openAreModal"),
   closeAreModal: document.querySelector("#closeAreModal"),
+  toggleAreFullscreen: document.querySelector("#toggleAreFullscreen"),
   areModal: document.querySelector("#areModal"),
   areModalBody: document.querySelector("#areModalBody"),
+  panelResizer: document.querySelector("#panelResizer"),
   openAlcModal: document.querySelector("#openAlcModal"),
   closeAlcModal: document.querySelector("#closeAlcModal"),
   alcModal: document.querySelector("#alcModal") || document.querySelector("#areModal"),
@@ -185,6 +186,7 @@ init();
 async function init() {
   bindEvents();
   renderEmpty();
+  restorePanelSize();
 
   try {
     const health = await fetchJson("/api/health");
@@ -200,7 +202,7 @@ async function init() {
     startSpaceMonitor();
     setStatus(isNativeMaidSpace() ? "local" : "fallback local", "ok");
   } catch (error) {
-    setStatus("servidor indisponível", "error");
+    setStatus("servidor indisponivel", "error");
   }
 }
 
@@ -221,6 +223,7 @@ function bindEvents() {
     renderFiles();
     renderGraph();
   });
+  elements.filesTable?.addEventListener("click", handleFilesTableClick);
   elements.graphCanvas.addEventListener("click", selectCanvasNode);
   elements.graphCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
   elements.graphCanvas.addEventListener("mousedown", startGraphPan);
@@ -242,6 +245,7 @@ function bindEvents() {
   elements.modeClose?.addEventListener("click", () => setGraphMode("close"));
   elements.openAreModal?.addEventListener("click", openAreModal);
   elements.closeAreModal?.addEventListener("click", closeAreModal);
+  elements.toggleAreFullscreen?.addEventListener("click", toggleAreModalFullscreen);
   elements.areModal?.querySelector("[data-close-modal='are']")?.addEventListener("click", closeAreModal);
   elements.openAlcModal?.addEventListener("click", openAlcModal);
   elements.closeAlcModal?.addEventListener("click", closeAlcModal);
@@ -277,6 +281,65 @@ function bindEvents() {
       scheduleGraphRender();
     }
   });
+  elements.panelResizer?.addEventListener("pointerdown", startPanelResize);
+  elements.panelResizer?.addEventListener("keydown", resizePanelWithKeyboard);
+}
+
+function restorePanelSize() {
+  const saved = Number(localStorage.getItem("maidspace:plan-panel-width") || 0);
+  if (saved > 260) {
+    setPlanPanelWidth(saved);
+  }
+}
+
+function setPlanPanelWidth(width) {
+  const safeWidth = clamp(Number(width || 0), 300, Math.min(720, Math.max(320, window.innerWidth - 520)));
+  document.documentElement.style.setProperty("--plan-panel-width", `${Math.round(safeWidth)}px`);
+  localStorage.setItem("maidspace:plan-panel-width", String(Math.round(safeWidth)));
+  scheduleGraphRender();
+}
+
+function startPanelResize(event) {
+  event.preventDefault();
+  state.panelResizeActive = true;
+  document.body.classList.add("is-resizing-panel");
+  const onMove = (moveEvent) => {
+    const width = window.innerWidth - moveEvent.clientX;
+    setPlanPanelWidth(width);
+  };
+  const onUp = () => {
+    state.panelResizeActive = false;
+    document.body.classList.remove("is-resizing-panel");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp, { once: true });
+}
+
+function resizePanelWithKeyboard(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    return;
+  }
+  event.preventDefault();
+  const current = Number.parseInt(getComputedStyle(document.documentElement).getPropertyValue("--plan-panel-width"), 10) || 360;
+  if (event.key === "Home") {
+    setPlanPanelWidth(320);
+  } else if (event.key === "End") {
+    setPlanPanelWidth(620);
+  } else {
+    setPlanPanelWidth(current + (event.key === "ArrowLeft" ? 32 : -32));
+  }
+}
+
+function toggleAreModalFullscreen() {
+  if (!elements.areModal) {
+    return;
+  }
+  const expanded = elements.areModal.classList.toggle("is-fullscreen");
+  if (elements.toggleAreFullscreen) {
+    elements.toggleAreFullscreen.textContent = expanded ? "Normal" : "Tela cheia";
+  }
 }
 
 function setGraphMode(modeKey) {
@@ -293,7 +356,7 @@ function setGraphMode(modeKey) {
 async function runScan() {
   const rootPath = elements.rootPath.value.trim();
   if (!rootPath) {
-    setStatus("informe um diretório", "error");
+    setStatus("informe um diretorio", "error");
     elements.rootPath.focus();
     return;
   }
@@ -379,12 +442,7 @@ async function runNativeScanJob(rootPath, options) {
   const listen = window.__TAURI__?.event?.listen;
   const invoke = window.__TAURI__?.core?.invoke;
   if (!listen || !invoke) {
-    const scan = await fetchNative("/api/scan", {
-      method: "POST",
-      body: JSON.stringify({ rootPath, options })
-    });
-    state.lastScanFinalReport = buildClientScanFinalReport("concluido", scan, state.scanProgress);
-    return scan;
+    return runNativeScanWithoutEvents(rootPath, options);
   }
 
   await stopScanProgressListener();
@@ -401,8 +459,7 @@ async function runNativeScanJob(rootPath, options) {
       handler(value);
     };
 
-    try {
-      state.scanProgressUnlisten = await listen("scan-progress", (event) => {
+    const handleScanProgress = (event) => {
         const payload = event.payload || {};
         if (acceptedJobId && payload.jobId && payload.jobId !== acceptedJobId) {
           return;
@@ -429,8 +486,21 @@ async function runNativeScanJob(rootPath, options) {
           error.finalReport = payload.finalReport || null;
           settle(reject, error);
         }
-      });
+    };
 
+    try {
+      state.scanProgressUnlisten = await listen("scan-progress", handleScanProgress);
+    } catch (error) {
+      appendSystemLog(`Progresso local indisponivel: ${errorMessage(error)}. Usando modo compativel.`);
+      try {
+        settle(resolve, await runNativeScanWithoutEvents(rootPath, options));
+      } catch (fallbackError) {
+        settle(reject, asError(fallbackError));
+      }
+      return;
+    }
+
+    try {
       const jobId = await invoke("start_scan_job", {
         rootPath,
         targetFreeBytes: options.targetFreeBytes || 0,
@@ -442,6 +512,15 @@ async function runNativeScanJob(rootPath, options) {
       settle(reject, asError(error));
     }
   });
+}
+
+async function runNativeScanWithoutEvents(rootPath, options) {
+  const scan = await fetchNative("/api/scan", {
+    method: "POST",
+    body: JSON.stringify({ rootPath, options })
+  });
+  state.lastScanFinalReport = buildClientScanFinalReport("concluido", scan, state.scanProgress);
+  return scan;
 }
 
 async function runStreamingScanJob(rootPath, options) {
@@ -457,7 +536,12 @@ async function runStreamingScanJob(rootPath, options) {
         rootPath,
         options: {
           ...options,
-          compactFinal: false
+          streamNodeLimit: 18000,
+          streamEdgeLimit: 60000,
+          areCandidateLimit: 240,
+          arePackageLimit: 120,
+          areBlockedLimit: 360,
+          areOperationLimit: 300
         }
       }),
       signal: state.scanAbortController.signal
@@ -1174,9 +1258,9 @@ function nativeReportToResult(scan, rootPath, options = {}) {
       : [],
     system: "MaidSpace",
     modules: {
-      add: { algorithm: "A.D.D", status: "concluido", summary },
-      are: { algorithm: "A.R.E", status: "plano_gerado", summary: relocationPlan.summary },
-      alc: { algorithm: "A.L.C", status: "local_sem_estado", summary: { reanalysisNeeded: false }, statePath: null }
+      add: { algorithm: "Grafo", status: "concluido", summary },
+      are: { algorithm: "Plano", status: "plano_gerado", summary: relocationPlan.summary },
+      alc: { algorithm: "Limpeza", status: "local_sem_estado", summary: { reanalysisNeeded: false }, statePath: null }
     },
     relocationPlan,
     diskStatus: scan.diskStatus || scan.disk || null,
@@ -1364,7 +1448,7 @@ function buildNativeRelocationPlan(nodes, summary, targetFreeBytes, rootPath = "
   const targetPlan = buildNativeTargetPlan(spaceModes, targetFreeBytes);
   return {
     schemaVersion: 4,
-    algorithm: "A.R.E",
+    algorithm: "Plano",
     safeMode: true,
     generatedAt: new Date().toISOString(),
     rootPath,
@@ -1486,7 +1570,7 @@ function buildNativeTargetPlan(spaceModes, targetFreeBytes) {
         ? `usar nivel ${mode} libera aproximadamente ${formatBytes(total)} com ${selected.length} arquivo(s).`
         : hasApproximation
           ? `nivel ${mode} chega perto da meta: ${formatBytes(total)} com ${selected.length} arquivo(s).`
-        : `nivel ${mode} estima ${modeData.reallocatableHuman}; a lista detalhada foi compactada e o A.L.C deve confirmar os candidatos finais.`
+        : `nivel ${mode} estima ${modeData.reallocatableHuman}; a lista detalhada foi compactada e a limpeza deve confirmar os candidatos finais.`
     };
   }
   return {
@@ -1950,7 +2034,7 @@ function appendAlcStageTimings(timings) {
     .map((key) => `${scanStageLabel(key)} ${formatDurationSeconds(Number(timings[key] || 0))}`)
     .join("; ");
   if (timingText) {
-    appendSystemLog(`A.L.C tempo por etapa: ${timingText}.`);
+    appendSystemLog(`Limpeza - tempo por etapa: ${timingText}.`);
   }
 }
 
@@ -2053,10 +2137,10 @@ function renderEmpty() {
   elements.metrics.innerHTML = metricMarkup([
     ["0", "entradas"],
     ["0", "arquivos"],
-    ["0", "diretórios"],
+    ["0", "diretorios"],
     ["0", "arestas"],
     ["0", "alto risco"],
-    ["0", "médio risco"],
+    ["0", "medio risco"],
     ["0", "baixo risco"],
     ["0", "candidatos"]
   ]);
@@ -2072,12 +2156,12 @@ function renderEmpty() {
     ["0", "risco"]
   ]);
   elements.filesTable.innerHTML = empty("Nenhuma varredura executada.");
-  elements.dependenciesTable.innerHTML = empty("Nenhuma dependência detectada ainda.");
+  elements.dependenciesTable.innerHTML = empty("Nenhuma dependencia detectada ainda.");
   elements.simulationGrid.innerHTML = "";
   if (elements.areSummary) elements.areSummary.innerHTML = empty("Execute uma varredura para calcular a relocacao.");
-  if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para abrir o Painel de Relocação.");
+  if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para abrir o Painel de Relocacao.");
   if (elements.openAreModal) elements.openAreModal.disabled = true;
-  if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty("Execute uma varredura para preparar o A.L.C.");
+  if (elements.alcModalBody && elements.alcModalBody !== elements.areModalBody) elements.alcModalBody.innerHTML = empty("Varrer para preparar a limpeza.");
   if (elements.openAlcModal) elements.openAlcModal.disabled = true;
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado.");
@@ -2116,10 +2200,10 @@ function renderMetrics() {
     [summary.entries, "entradas lidas"],
     [summary.cycles || 0, "ciclos"],
     [summary.files, "arquivos"],
-    [summary.directories, "diretórios"],
+    [summary.directories, "diretorios"],
     [summary.canDelete || 0, "pode apagar"],
-    [summary.probablyUseless || 0, "inútil provável"],
-    [summary.mustKeep || 0, "não apagar"],
+    [summary.probablyUseless || 0, "inutil provavel"],
+    [summary.mustKeep || 0, "nao apagar"],
     [summary.byRisk.critico || 0, "critico"],
     [summary.byRisk.alto || 0, "alto risco"],
     [summary.staleCandidates || summary.candidateLowRisk, `candidatos - ${scale}`]
@@ -2202,7 +2286,7 @@ function renderGraph() {
   updateZoomLabel(mode);
 
   if (!visibleNodes.length) {
-    clearCanvas("Nenhum nó dentro do filtro atual.");
+    clearCanvas("Nenhum no dentro do filtro atual.");
     return;
   }
 
@@ -2457,7 +2541,7 @@ function buildUiGroupNode(groupId, key, files, mode, expanded) {
     children: files.map((file) => file.id),
     searchText: files.map((file) => file.relativePath).join(" "),
     expanded,
-    groupReason: expanded ? "grupo aberto" : "grupo expansível"
+    groupReason: expanded ? "grupo aberto" : "grupo expansivel"
   };
 }
 
@@ -2569,7 +2653,7 @@ function nodeMatchesDepth(node, depthFilter) {
 function focusText() {
   const focused = state.hoveredNodeId || state.selectedNodeId;
   if (!focused) {
-    return "visão limpa";
+    return "visao limpa";
   }
   const node = state.currentGraphNodes.find((item) => item.id === focused);
   return node ? `foco: ${trimLabel(node.label || node.relativePath, 28)}` : "foco ativo";
@@ -2622,9 +2706,9 @@ function computeImpactLayout(nodes, width, height, mode) {
 function decisionZones(width, height) {
   return {
     pode_apagar: { x: width * 0.22, y: height * 0.7, rx: width * 0.16, ry: height * 0.18, label: "pode apagar", color: "#2f8f57" },
-    inutil_provavel: { x: width * 0.26, y: height * 0.32, rx: width * 0.16, ry: height * 0.18, label: "inútil provável", color: "#84a94f" },
+    inutil_provavel: { x: width * 0.26, y: height * 0.32, rx: width * 0.16, ry: height * 0.18, label: "inutil provavel", color: "#84a94f" },
     averiguar: { x: width * 0.56, y: height * 0.48, rx: width * 0.19, ry: height * 0.24, label: "averiguar", color: "#d7a02c" },
-    nao_apagar: { x: width * 0.82, y: height * 0.48, rx: width * 0.15, ry: height * 0.28, label: "não apagar", color: "#c84444" }
+    nao_apagar: { x: width * 0.82, y: height * 0.48, rx: width * 0.15, ry: height * 0.28, label: "nao apagar", color: "#c84444" }
   };
 }
 
@@ -2751,7 +2835,7 @@ function drawNodes(context, layout, mode) {
       context.font = "800 11px Segoe UI, sans-serif";
       context.textAlign = "center";
       context.textBaseline = "middle";
-      context.fillText(node.expanded ? "−" : formatCompact(node.fileCount), point.x, point.y);
+      context.fillText(node.expanded ? "a" : formatCompact(node.fileCount), point.x, point.y);
     }
   }
   context.globalAlpha = 1;
@@ -2771,7 +2855,7 @@ function drawNodeLabel(context, point, mode, options = {}) {
   const labelSource = options.compact
     ? point.node.dominantFileName || point.node.label || point.node.relativePath
     : point.node.label || point.node.dominantFileName || point.node.relativePath;
-  const label = trimLabel(labelSource || "nó", mode.key === "close" ? 30 : 24);
+  const label = trimLabel(labelSource || "no", mode.key === "close" ? 30 : 24);
   context.font = mode.key === "close" ? "12px Cascadia Mono, Consolas, monospace" : "800 12px Segoe UI, sans-serif";
   context.textAlign = "center";
   context.textBaseline = "top";
@@ -3103,7 +3187,7 @@ function renderFileDependencyPopover(path, node, dependencyMap) {
         ${outgoing.length ? `<ol>${outgoing.map((item) => `<li>${fileMapButton(item.path)}<small>${escapeHtml(item.type || "dep")}</small></li>`).join("")}</ol>` : `<p class="muted">Nenhuma saida registrada.</p>`}
       </section>
     </div>
-    ${related.length ? "" : `<p class="muted">Sem arestas no inventario atual; para arquivos do modo Rust local, o A.D.D pode ter apenas metadados.</p>`}
+    ${related.length ? "" : `<p class="muted">Sem arestas no inventario atual; para arquivos do modo Rust local, o inventario pode ter apenas metadados.</p>`}
   `;
 }
 
@@ -3175,8 +3259,8 @@ function renderNodeDetails() {
   const node = graphNode || fileNode;
   if (!node) {
     elements.nodeDetails.innerHTML = `
-      <h2>Nó selecionado</h2>
-      <p class="muted">Clique em um nó do grafo ou em uma linha da tabela.</p>
+      <h2>No selecionado</h2>
+      <p class="muted">Clique em um no do grafo ou em uma linha da tabela.</p>
     `;
     return;
   }
@@ -3185,7 +3269,7 @@ function renderNodeDetails() {
     .map((id) => state.result.nodes.find((item) => item.id === id))
     .filter(Boolean);
   const samples = childFiles.slice(0, 8).map((item) => item.relativePath).join("; ");
-  const reasons = node.protectedReasons?.length ? node.protectedReasons.join(", ") : node.groupReason || "sem proteção especial";
+  const reasons = node.protectedReasons?.length ? node.protectedReasons.join(", ") : node.groupReason || "sem protecao especial";
   const riskReasons = node.riskReasons?.length ? node.riskReasons.join("; ") : reasons;
   const unresolved = node.unresolvedSpecifiers?.length
     ? node.unresolvedSpecifiers.map((item) => `${item.type}: ${item.specifier}`).join("; ")
@@ -3194,27 +3278,27 @@ function renderNodeDetails() {
   elements.nodeDetails.innerHTML = `
     <h2>${escapeHtml(node.label || node.name || node.relativePath)}</h2>
     <dl>
-      <dt>visão</dt><dd>${escapeHtml(graphModes[state.graphMode]?.label || "arquivo")}</dd>
+      <dt>visao</dt><dd>${escapeHtml(graphModes[state.graphMode]?.label || "arquivo")}</dd>
       <dt>caminho</dt><dd>${fileMapButton(node.relativePath || "-")}</dd>
       <dt>classe</dt><dd>${escapeHtml(labels[node.classification] || node.classification || "-")}</dd>
       <dt>risco</dt><dd>${riskMarkup(node.risk)}</dd>
       <dt>apagar</dt><dd>${escapeHtml(decisionLabel(node.deletionDecision))}</dd>
       <dt>utilidade</dt><dd>${escapeHtml(utilityLabel(node.utilityStatus))}</dd>
       <dt>sistema</dt><dd>${escapeHtml(impactLabel(node.impact?.system))}</dd>
-      <dt>usuário</dt><dd>${escapeHtml(impactLabel(node.impact?.user))}</dd>
+      <dt>usuario</dt><dd>${escapeHtml(impactLabel(node.impact?.user))}</dd>
       <dt>deps</dt><dd>${escapeHtml(impactLabel(node.impact?.dependencies))}</dd>
       <dt>arquivos</dt><dd>${formatNumber(node.fileCount || 1)}</dd>
-      <dt>diretórios</dt><dd>${formatNumber(node.directoryCount || 0)}</dd>
+      <dt>diretorios</dt><dd>${formatNumber(node.directoryCount || 0)}</dd>
       <dt>entrada</dt><dd>${formatNumber(node.incoming || 0)}</dd>
-      <dt>saída</dt><dd>${formatNumber(node.outgoing || 0)}</dd>
+      <dt>saida</dt><dd>${formatNumber(node.outgoing || 0)}</dd>
       <dt>impacto</dt><dd>${formatNumber(node.impactCount || 0)}</dd>
       <dt>score</dt><dd>${formatNumber(node.riskScore || 0)}</dd>
       <dt>profundidade</dt><dd>${formatNumber(node.depth || 0)}</dd>
       <dt>tamanho</dt><dd>${formatBytes(node.size || 0)}</dd>
-      <dt>último uso</dt><dd>${formatAccess(node.daysSinceAccess)}</dd>
-      <dt>ação</dt><dd>${escapeHtml(node.action || node.simulationAction || "-")}</dd>
+      <dt>Ultimo uso</dt><dd>${formatAccess(node.daysSinceAccess)}</dd>
+      <dt>acao</dt><dd>${escapeHtml(node.action || node.simulationAction || "-")}</dd>
       <dt>motivo</dt><dd>${escapeHtml(riskReasons)}</dd>
-      <dt>pendências</dt><dd>${escapeHtml(unresolved)}</dd>
+      <dt>pendencias</dt><dd>${escapeHtml(unresolved)}</dd>
       <dt>amostra</dt><dd>${escapeHtml(samples || "-")}</dd>
     </dl>
   `;
@@ -3227,15 +3311,15 @@ function renderFiles() {
 
   const query = elements.fileSearch.value.trim().toLowerCase();
   const depthFilter = elements.depthFilter?.value || "all";
-  const rows = state.result.nodes
+  const matchingRows = state.result.nodes
     .filter((node) => node.kind === "file")
     .filter((node) => depthFilter === "all" || nodeMatchesDepth(node, depthFilter))
     .filter((node) => !query || node.relativePath.toLowerCase().includes(query))
     .sort((a, b) => {
       const riskDiff = riskWeight[b.risk] - riskWeight[a.risk];
       return riskDiff || b.incoming - a.incoming || a.relativePath.localeCompare(b.relativePath);
-    })
-    .slice(0, 1000);
+    });
+  const rows = matchingRows.slice(0, 1000);
 
   if (!rows.length) {
     elements.filesTable.innerHTML = empty("Nenhum arquivo encontrado no filtro.");
@@ -3243,6 +3327,7 @@ function renderFiles() {
   }
 
   elements.filesTable.innerHTML = `
+    ${matchingRows.length > rows.length ? `<div class="table-note">Mostrando ${formatNumber(rows.length)} de ${formatNumber(matchingRows.length)} arquivo(s). Use busca ou profundidade para refinar.</div>` : ""}
     <table>
       <thead>
         <tr>
@@ -3251,10 +3336,10 @@ function renderFiles() {
           <th>Utilidade</th>
           <th>Classe</th>
           <th>Entrada</th>
-          <th>Saída</th>
+          <th>Saida</th>
           <th>Impacto</th>
           <th>Prof.</th>
-          <th>Último uso</th>
+          <th>Ultimo uso</th>
           <th>Tamanho</th>
           <th>Caminho</th>
         </tr>
@@ -3278,15 +3363,17 @@ function renderFiles() {
       </tbody>
     </table>
   `;
+}
 
-  elements.filesTable.querySelectorAll("tr[data-node-id]").forEach((row) => {
-    row.addEventListener("click", () => {
-      state.zoom = 1.9;
-      state.selectedNodeId = row.dataset.nodeId;
-      renderNodeDetails();
-      renderGraph();
-    });
-  });
+function handleFilesTableClick(event) {
+  const row = event.target.closest?.("tr[data-node-id]");
+  if (!row || !elements.filesTable?.contains(row)) {
+    return;
+  }
+  state.zoom = 1.9;
+  state.selectedNodeId = row.dataset.nodeId;
+  renderNodeDetails();
+  renderGraph();
 }
 
 function renderSimulation() {
@@ -3296,10 +3383,10 @@ function renderSimulation() {
   return renderDiskUsageList();
 
   const groups = [
-    ["pode_apagar", "Pode apagar", "não afeta sistema nem dependências relevantes"],
-    ["inutil_provavel", "Inútil provável", "baixo uso, baixo impacto, bom candidato"],
-    ["averiguar", "Averiguar", "incerteza, uso ou dependência moderada"],
-    ["nao_apagar", "Não apagar", "sistema, uso recente ou impacto alto"]
+    ["pode_apagar", "Pode apagar", "nao afeta sistema nem dependencias relevantes"],
+    ["inutil_provavel", "Inutil provavel", "baixo uso, baixo impacto, bom candidato"],
+    ["averiguar", "Averiguar", "incerteza, uso ou dependencia moderada"],
+    ["nao_apagar", "Nao apagar", "sistema, uso recente ou impacto alto"]
   ];
   const decisions = state.result.simulation?.decisionGroups || buildDecisionGroupsFromNodes(state.result.nodes || []);
 
@@ -3530,10 +3617,10 @@ function renderAreAlcBridge(plan) {
     <section class="are-simulation-board are-alc-bridge">
       <div class="are-section-heading">
         <div>
-          <h3>A.R.E -> A.L.C</h3>
-          <p class="muted">Use o plano do A.R.E como fila editavel do A.L.C: filtre por nivel, risco e confirme apenas o que deve ser realocado.</p>
+          <h3>Plano de limpeza</h3>
+          <p class="muted">Use o plano como lista editavel: filtre, revise e confirme o que sera movido.</p>
         </div>
-        <button class="primary-button" type="button" data-open-alc-modal>Abrir A.L.C</button>
+        <button class="primary-button" type="button" data-open-alc-modal>Abrir limpeza</button>
       </div>
       <div class="are-simulation-grid">
         <article class="are-sim-card">
@@ -3544,7 +3631,7 @@ function renderAreAlcBridge(plan) {
         <article class="are-sim-card">
           <span>Espaco visivel</span>
           <strong>${formatBytes(potentialBytes)}</strong>
-          <small>${total > 0 ? "A.L.C confirma antes de mover" : "A.R.E estimou; falta detalhe executavel"}</small>
+          <small>${total > 0 ? "Confirmar antes de mover" : "Estimado; detalhe antes de executar"}</small>
         </article>
         <article class="are-sim-card">
           <span>Nivel sugerido</span>
@@ -3600,7 +3687,7 @@ function renderAreDepthBreakdown(plan) {
       <div class="are-section-heading">
         <div>
           <h3>Realocacao por profundidade</h3>
-          <p class="muted">Cada linha soma a camada lida pelo A.D.D; o total do A.R.E usa todas as camadas acumuladas.</p>
+          <p class="muted">Cada linha soma uma camada lida; o total usa tudo o que foi encontrado.</p>
         </div>
       </div>
       <div class="table-wrap are-table-wrap">
@@ -3856,7 +3943,7 @@ function showIntroTutorial({ manual = false } = {}) {
       <dl>
         <dt>Mapa</dt><dd>Dependencias, grupos, riscos e selecao.</dd>
         <dt>Relocacao</dt><dd>Plano, destino, waves, progresso e resultado.</dd>
-        <dt>Detalhes</dt><dd>Manifesto, log e arquivos afetados ficam recolhidos.</dd>
+        <dt>Detalhes</dt><dd>Relatorio, log e arquivos afetados ficam recolhidos.</dd>
       </dl>
       <div class="runtime-dialog-actions">
         <button id="closeIntroTutorial" class="primary-button" type="button">Entendi</button>
@@ -3899,7 +3986,7 @@ function renderAlcModal() {
   const userSourceCandidates = sourceCandidates.filter(isLikelyUserContentCandidate);
   const targetPlan = state.result?.relocationPlan?.targetPlan || state.result?.relocationPlan?.summary?.targetPlan;
   if (!state.result?.relocationPlan) {
-    return empty("Execute uma varredura para preparar o A.L.C.");
+    return empty("Varrer para preparar a limpeza.");
   }
 
   const totalBytes = sourceCandidates.reduce((sum, item) => sum + candidateBytes(item), 0);
@@ -4438,7 +4525,7 @@ function renderAlcMiniExplorer(candidates, plannedBytes, previewBytes) {
           <button class="alc-folder-card" type="button" data-alc-folder-filter="${escapeHtml(group.path === "." ? "" : group.path)}">
             <span>${escapeHtml(group.path === "." ? "raiz" : group.path)}</span>
             <strong>${escapeHtml(formatBytes(group.bytes))}</strong>
-            <small>${formatNumber(group.files)} arquivo(s) · ${escapeHtml(maxRiskLabel(Array.from(group.risks)))}</small>
+            <small>${formatNumber(group.files)} arquivo(s) - ${escapeHtml(maxRiskLabel(Array.from(group.risks)))}</small>
           </button>
         `).join("")}
       </div>
@@ -4466,11 +4553,11 @@ function renderAlcCandidateTable(candidates, sourceCandidates, filteredCandidate
   const hiddenCount = Math.max(0, filteredCandidates.length - candidates.length);
   const emptyMessage = hasSource
     ? "Nenhum arquivo combina com os filtros atuais. Ajuste riscos, decisao, busca ou a aba de visao."
-    : "Esta fonte do A.R.E nao tem candidatos detalhados carregados para o A.L.C. Os totais ainda aparecem nos planos acima quando o A.R.E usou estimativa.";
+    : "Esta fonte ainda nao tem arquivos detalhados. Os totais do plano continuam acima quando a lista for estimada.";
 
   return `
     <div class="table-wrap alc-table-wrap">
-      ${hiddenCount ? `<div class="alc-table-note">Mostrando ${formatNumber(candidates.length)} de ${formatNumber(filteredCandidates.length)} candidato(s). A execução usa o plano filtrado inteiro.</div>` : ""}
+      ${hiddenCount ? `<div class="alc-table-note">Mostrando ${formatNumber(candidates.length)} de ${formatNumber(filteredCandidates.length)} candidato(s). A execucao usa o plano filtrado inteiro.</div>` : ""}
       <table class="alc-table">
         <thead>
           <tr>
@@ -4547,7 +4634,7 @@ function renderAlcProgressPanel() {
         </div>
         <button id="cancelAlcButton" class="ghost-button" type="button"${progress && progress.phase !== "done" && !progress.cancelled ? "" : " disabled"}>Cancelar</button>
       </div>
-      <div class="progress-track" aria-label="A.L.C">
+      <div class="progress-track" aria-label="Limpeza">
         <span id="alcProgressBar" class="progress-fill" style="width: ${percent}%"></span>
       </div>
       <div class="alc-wave-progress">
@@ -4630,10 +4717,15 @@ async function startAlcProgressListener() {
   if (!listen) {
     return;
   }
-  state.alcProgressUnlisten = await listen("alc-progress", (event) => {
-    state.alcProgress = normalizeAlcProgress(event.payload);
-    updateAlcProgressPanel();
-  });
+  try {
+    state.alcProgressUnlisten = await listen("alc-progress", (event) => {
+      state.alcProgress = normalizeAlcProgress(event.payload);
+      updateAlcProgressPanel();
+    });
+  } catch (error) {
+    appendSystemLog(`Progresso local indisponivel: ${errorMessage(error)}`);
+    state.alcProgressUnlisten = null;
+  }
 }
 
 async function stopAlcProgressListener() {
@@ -4672,7 +4764,7 @@ async function cancelAlcRelocation() {
     await fetchJson("/api/alc/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operationId: state.alcOperationId })
+      body: JSON.stringify({ operationId: state.alcOperationId, jobId: state.alcJobId })
     });
   } catch (error) {
     appendSystemLog(`Cancelar: ${errorMessage(error)}`);
@@ -4682,6 +4774,51 @@ async function cancelAlcRelocation() {
 function createClientOperationId() {
   const random = Math.random().toString(16).slice(2, 10);
   return `ui-${Date.now().toString(36)}-${random}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function runAlcRelocationHttpJob(request, context = {}) {
+  const started = await fetchJson("/api/alc/relocate-job", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request })
+  });
+  state.alcJobId = started.jobId || null;
+  state.alcOperationId = started.operationId || state.alcOperationId;
+  if (started.progress) {
+    state.alcProgress = normalizeAlcProgress({
+      ...started.progress,
+      targetBytes: context.targetBytes,
+      waveBytes: context.wavePlan?.waveBytes,
+      waveCount: context.wavePlan?.total
+    });
+    updateAlcProgressPanel();
+  }
+
+  while (state.alcJobId) {
+    await wait(250);
+    const job = await fetchJson(`/api/alc/jobs/${encodeURIComponent(state.alcJobId)}`);
+    if (job.progress) {
+      state.alcProgress = normalizeAlcProgress({
+        ...job.progress,
+        targetBytes: job.progress.targetBytes || context.targetBytes,
+        waveBytes: job.progress.waveBytes || context.wavePlan?.waveBytes,
+        waveCount: job.progress.waveCount || context.wavePlan?.total
+      });
+      updateAlcProgressPanel();
+    }
+    if (job.status === "completed" || job.status === "cancelled") {
+      return job.report;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.error || "Falha na limpeza.");
+    }
+  }
+
+  throw new Error("Job de limpeza encerrado sem relatorio.");
 }
 
 async function openLocalPath(targetPath) {
@@ -4843,7 +4980,7 @@ function wireAlcModalControls(root = null) {
   });
   body.querySelector("#chooseAlcDestination")?.addEventListener("click", async () => {
     try {
-      const directory = await pickDirectory("Cole o caminho de destino do A.L.C:");
+      const directory = await pickDirectory("Cole o caminho de destino:");
       if (directory && destinationInput) {
         destinationInput.value = directory;
         update();
@@ -4872,7 +5009,7 @@ function wireAlcModalControls(root = null) {
     try {
       await expandAlcCandidatesIfNeeded();
     } catch (error) {
-      appendSystemLog(`Mini-explorador A.L.C: ${errorMessage(error)}`);
+      appendSystemLog(`Pastas maiores: ${errorMessage(error)}`);
       showAlcResult(null, error);
     }
   });
@@ -5003,7 +5140,7 @@ function resetAlcAuditTrail() {
 }
 
 function rootAuditKey() {
-  return normalizeRelativePath(String(state.result?.rootPath || elements.rootPath?.value || "").replace(/^[a-zA-Z]:/, ""));
+  return normalizeRelativePath(String(state.result?.rootPath || elements.rootPath?.value || "").replace(/^[a-z-Z]:/, ""));
 }
 
 function currentAlcListAuditKey(plan = state.result?.relocationPlan) {
@@ -5224,8 +5361,8 @@ function normalizeExemptionInput(value) {
 }
 
 function directoryToRelative(rootPath, directory) {
-  const normalizedRoot = normalizeRelativePath(String(rootPath || "").replace(/^[a-zA-Z]:/, ""));
-  const normalizedDirectory = normalizeRelativePath(String(directory || "").replace(/^[a-zA-Z]:/, ""));
+  const normalizedRoot = normalizeRelativePath(String(rootPath || "").replace(/^[a-z-Z]:/, ""));
+  const normalizedDirectory = normalizeRelativePath(String(directory || "").replace(/^[a-z-Z]:/, ""));
   if (normalizedRoot && normalizedDirectory.startsWith(`${normalizedRoot}/`)) {
     return normalizedDirectory.slice(normalizedRoot.length + 1);
   }
@@ -5252,7 +5389,7 @@ async function expandAlcCandidatesIfNeeded() {
   }
 
   state.alcExpansionStatus = `Detalhando fila ${modeLabel(executionMode)} ate ${formatBytes(targetBytes)}...`;
-  appendSystemLog(`A.L.C expandindo candidatos: ${formatBytes(sourceBytes)} detalhados de ${formatBytes(targetBytes)} previstos.`);
+  appendSystemLog(`Limpeza detalhando itens: ${formatBytes(sourceBytes)} detalhados de ${formatBytes(targetBytes)} previstos.`);
   refreshAlcModal();
 
   const result = await fetchJson("/api/alc/expand-candidates", {
@@ -5268,9 +5405,9 @@ async function expandAlcCandidatesIfNeeded() {
 
   const candidates = Array.isArray(result.candidates) ? result.candidates : [];
   if (!candidates.length) {
-    state.alcExpansionStatus = "A.L.C nao encontrou candidatos reais suficientes para esta meta.";
+    state.alcExpansionStatus = "A limpeza nao encontrou itens suficientes para esta meta.";
     refreshAlcModal();
-    throw new Error("O A.L.C nao encontrou arquivos executaveis para cumprir este plano. Rode nova varredura ou revise filtros/isencoes.");
+    throw new Error("A limpeza nao encontrou arquivos para cumprir este plano. Rode nova varredura ou revise filtros/isencoes.");
   }
 
   state.alcExpandedCandidates[key] = {
@@ -5283,7 +5420,7 @@ async function expandAlcCandidatesIfNeeded() {
     bytes: result.bytes || candidates.reduce((sum, item) => sum + candidateBytes(item), 0)
   });
   state.alcExpansionStatus = `Fila expandida: ${formatNumber(candidates.length)} arquivo(s), ${formatBytes(result.bytes || 0)}.`;
-  appendSystemLog(`A.L.C preparou ${formatNumber(candidates.length)} candidato(s), somando ${formatBytes(result.bytes || 0)}.`);
+  appendSystemLog(`Limpeza preparou ${formatNumber(candidates.length)} candidato(s), somando ${formatBytes(result.bytes || 0)}.`);
   refreshAlcModal();
   return true;
 }
@@ -5331,7 +5468,7 @@ function estimateAlcVolumeInfo({ rootPath, targetKind, targetDirectory }) {
 
 function windowsVolumeRoot(value) {
   const text = String(value || "").trim();
-  const drive = text.match(/^[a-zA-Z]:[\\/]/);
+  const drive = text.match(/^[a-z-Z]:[\\/]/);
   if (drive) {
     return drive[0].slice(0, 2).toUpperCase();
   }
@@ -5415,6 +5552,10 @@ async function runAlcRelocation({ dryRun = false } = {}) {
   if (!body) {
     return;
   }
+  if (state.alcOperationId || state.alcJobId) {
+    showAlcResult(null, new Error("Ja existe uma limpeza em andamento. Aguarde ou cancele com seguranca."));
+    return;
+  }
 
   const targetKind = body.querySelector("input[name='alcTargetKind']:checked")?.value || "directory";
   const targetDirectory = targetKind === "directory"
@@ -5434,7 +5575,7 @@ async function runAlcRelocation({ dryRun = false } = {}) {
     try {
       await expandAlcCandidatesIfNeeded();
     } catch (error) {
-      appendSystemLog(`Mini-explorador A.L.C parcial: ${errorMessage(error)}. A simulacao usara a fila visivel atual.`);
+      appendSystemLog(`Pastas maiores parcial: ${errorMessage(error)}. A simulacao usara a fila visivel atual.`);
     }
   }
 
@@ -5465,7 +5606,7 @@ async function runAlcRelocation({ dryRun = false } = {}) {
   }
 
   if (executeByPlan && !dryRun && !audit.ready) {
-    showAlcResult(null, new Error(`A fila atual ainda e uma estimativa do A.R.E. Clique em Expandir ou Simular antes de executar para gerar uma lista auditavel. Visivel agora: ${formatNumber(candidates.length)} arquivo(s), ${formatBytes(selectedBytes)} de ${formatBytes(planTargetBytes)} planejados.`));
+    showAlcResult(null, new Error(`A lista atual ainda e uma estimativa. Clique em Detalhar ou Simular antes de executar. Visivel agora: ${formatNumber(candidates.length)} arquivo(s), ${formatBytes(selectedBytes)} de ${formatBytes(planTargetBytes)} planejados.`));
     return;
   }
 
@@ -5509,6 +5650,8 @@ async function runAlcRelocation({ dryRun = false } = {}) {
   }
   state.alcCancelRequested = false;
   state.alcOperationId = createClientOperationId();
+  state.alcJobId = null;
+  document.body.classList.add("is-alc-running");
   state.alcProgressStartedAt = performance.now();
   state.alcProgress = normalizeAlcProgress({
     phase: dryRun ? "dry-run" : "start",
@@ -5552,11 +5695,16 @@ async function runAlcRelocation({ dryRun = false } = {}) {
         manualApproval: preferenceDecisionForCandidate(item) === "relocate"
       }))
     };
-    const report = await fetchJson("/api/alc/relocate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request })
-    });
+    const report = isNativeMaidSpace()
+      ? await fetchJson("/api/alc/relocate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request })
+        })
+      : await runAlcRelocationHttpJob(request, {
+          targetBytes: confirmationBytes,
+          wavePlan
+        });
     state.lastAlcReport = report;
     if (dryRun) {
       markAlcSimulationAudit(simulationAuditKey, report);
@@ -5576,18 +5724,18 @@ async function runAlcRelocation({ dryRun = false } = {}) {
     });
     updateAlcProgressPanel();
     appendSystemLog(dryRun
-      ? `A.L.C simulado: ${formatNumber(report.plannedFiles || report.operations?.length || 0)} item(ns), manifesto ${report.manifestPath || "gerado"}.`
-      : `A.L.C executado: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
-    appendSystemLog(`A.L.C auditoria: ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns), manifesto ${report.manifestPath || "gerado"}.`);
-    appendSystemLog(`A.L.C plano fonte: ${formatNumber(report.plannedFiles || candidates.length)} item(ns), ${formatNumber(report.waveCount || wavePlan.total)} wave(s); log visivel e resumo, nao fila.`);
+      ? `Limpeza simulada: ${formatNumber(report.plannedFiles || report.operations?.length || 0)} item(ns), relatorio ${report.manifestPath || "gerado"}.`
+      : `Limpeza executada: ${formatNumber(report.movedFiles || 0)} arquivo(s), ${formatBytes(report.movedBytes || 0)} ${alcReportActionLabel(report)}.`);
+    appendSystemLog(`Relatorio: ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns), relatorio ${report.manifestPath || "gerado"}.`);
+    appendSystemLog(`Plano fonte: ${formatNumber(report.plannedFiles || candidates.length)} item(ns), ${formatNumber(report.waveCount || wavePlan.total)} etapa(s); log visivel e resumo, nao fila.`);
     if (report.volumeInfo?.message) {
-      appendSystemLog(`A.L.C volume: ${report.volumeInfo.message}.`);
+      appendSystemLog(`Volume: ${report.volumeInfo.message}.`);
     }
     appendAlcStageTimings(report.stageTimings);
     showAlcResult(report);
     executionCompleted = !dryRun && !report.cancelled;
   } catch (error) {
-    appendSystemLog(`Erro A.L.C: ${errorMessage(error)}`);
+    appendSystemLog(`Erro na limpeza: ${errorMessage(error)}`);
     showAlcResult(null, error);
   } finally {
     await stopAlcProgressListener();
@@ -5596,6 +5744,8 @@ async function runAlcRelocation({ dryRun = false } = {}) {
       executeButton.disabled = executionCompleted;
     }
     state.alcOperationId = null;
+    state.alcJobId = null;
+    document.body.classList.remove("is-alc-running");
     state.alcCancelRequested = false;
     updateAlcProgressPanel();
   }
@@ -5610,7 +5760,7 @@ function showAlcResult(report, error = null) {
   if (error) {
     result.classList.add("is-error");
     result.innerHTML = `
-      <strong>Falha no A.L.C</strong>
+      <strong>Falha na limpeza</strong>
       <span>${escapeHtml(errorMessage(error))}</span>
     `;
     return;
@@ -5648,11 +5798,11 @@ function showAlcResult(report, error = null) {
       ? "enviados para a lixeira"
       : "retirados da raiz";
   result.innerHTML = `
-    <strong>A.L.C concluido</strong>
+    <strong>Limpeza concluida</strong>
     <span>${formatNumber(report.movedFiles || 0)} arquivo(s) ${actionLabel}, ${formatBytes(report.movedBytes || 0)} ${spaceLabel}.</span>
     <span>Etapas: ${formatNumber(report.wavesCompleted || report.waveCount || 1)} de ${formatNumber(report.waveCount || 1)}. Media: ${formatBytes(report.averageBytesPerSecond || 0)}/s.</span>
-    <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o A.D.D/A.R.E.</span>
-    <span>Relatorio: ${escapeHtml(report.manifestUsedPath || report.finalManifestPath || report.manifestPath || "-")} · ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns).</span>
+    <span>${formatNumber(report.failedFiles || 0)} falha(s), ${formatNumber(report.skippedFiles || 0)} ignorado(s). Execute nova varredura para atualizar o grafo e o plano.</span>
+    <span>Relatorio: ${escapeHtml(report.manifestUsedPath || report.finalManifestPath || report.manifestPath || "-")} - ${formatNumber(report.auditedItemCount || report.plannedFiles || 0)} item(ns).</span>
   `;
   refreshAlcReportButtons();
 }
@@ -5725,7 +5875,7 @@ function renderContinuousState() {
 
   const alc = state.result.continuousState;
   if (!alc) {
-    elements.continuousState.innerHTML = empty("Estado A.L.C indisponivel.");
+    elements.continuousState.innerHTML = empty("Estado da limpeza indisponivel.");
     return;
   }
 
@@ -5822,7 +5972,7 @@ function renderDependencies() {
 
   const rows = state.result.edges.slice(0, 1200);
   if (!rows.length) {
-    elements.dependenciesTable.innerHTML = empty("Nenhuma dependência local resolvida.");
+    elements.dependenciesTable.innerHTML = empty("Nenhuma dependencia local resolvida.");
     return;
   }
 
@@ -5834,7 +5984,7 @@ function renderDependencies() {
           <th>Linha</th>
           <th>Origem</th>
           <th>Destino</th>
-          <th>Declaração</th>
+          <th>Declaracao</th>
         </tr>
       </thead>
       <tbody>
@@ -5896,9 +6046,9 @@ function riskMarkup(risk) {
 function decisionLabel(value) {
   const labels = {
     pode_apagar: "pode apagar",
-    inutil_provavel: "inútil provável",
+    inutil_provavel: "inutil provavel",
     averiguar: "averiguar",
-    nao_apagar: "não apagar"
+    nao_apagar: "nao apagar"
   };
   return labels[value] || value || "-";
 }
@@ -5908,9 +6058,9 @@ function utilityLabel(value) {
     sistema: "sistema",
     protegido: "protegido",
     usado_pelo_usuario: "usado",
-    dependencia_relevante: "dependência relevante",
+    dependencia_relevante: "dependencia relevante",
     bloco_interdependente: "bloco interdependente",
-    inutil_provavel: "inútil provável",
+    inutil_provavel: "inutil provavel",
     baixo_uso: "baixo uso",
     utilidade_incerta: "incerta",
     desconhecido: "desconhecida"
@@ -5921,11 +6071,11 @@ function utilityLabel(value) {
 function impactLabel(value) {
   const labels = {
     afeta_sistema: "afeta sistema",
-    nao_afeta_sistema: "não afeta sistema",
+    nao_afeta_sistema: "nao afeta sistema",
     protegido: "protegido",
     critico: "critico",
     alto: "alto",
-    medio: "médio",
+    medio: "medio",
     baixo: "baixo",
     nenhum: "nenhum",
     incerto: "incerto"
@@ -5981,7 +6131,7 @@ function trimLabel(value, maxLength) {
   if (text.length <= maxLength) {
     return text;
   }
-  return `${text.slice(0, Math.max(3, maxLength - 1))}…`;
+  return `${text.slice(0, Math.max(3, maxLength - 1))}a`;
 }
 
 function hexToRgba(hex, alpha) {

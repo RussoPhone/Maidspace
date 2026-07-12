@@ -20,7 +20,7 @@
           <span id="serverStatus" class="status-pill">...</span>
           <button id="helpButton" class="ghost-button" type="button">Como usar</button>
           <button id="exportButton" class="ghost-button" type="button" disabled title="Exportar relatorio JSON">
-            <span aria-hidden="true">⇩</span>
+            <span aria-hidden="true"></span>
             JSON
           </button>
         </div>
@@ -52,7 +52,7 @@
           </div>
           <div class="scan-actions">
             <button id="scanButton" class="primary-button" type="button" title="Executar MaidSpace">
-              <span aria-hidden="true">▶</span>
+              <span aria-hidden="true">></span>
               Varrer
             </button>
             <button id="cancelScanButton" class="ghost-button" type="button" disabled>
@@ -82,7 +82,7 @@
         </section>
 
         <section class="rail-section">
-          <h2>A.D.D</h2>
+          <h2>Grafo</h2>
           <div class="mode-stack" aria-label="Modos de zoom">
             <button id="modeFar" class="mode-button" type="button">Mapa</button>
             <button id="modeMedium" class="mode-button is-active" type="button">Grupos</button>
@@ -114,7 +114,7 @@
       <main class="graph-workbench release-workbench">
         <section class="workspace-heading map-workspace-heading" aria-label="Grafo de dependencias">
           <div>
-            <span class="eyebrow">A.D.D</span>
+            <span class="eyebrow">Dependencias</span>
             <h2>Grafo de dependencias</h2>
           </div>
         </section>
@@ -128,7 +128,7 @@
             </div>
             <span id="zoomLabel" class="zoom-label">medio - 100%</span>
           </div>
-          <canvas id="graphCanvas" width="1200" height="720" aria-label="Canvas do grafo A.D.D"></canvas>
+          <canvas id="graphCanvas" width="1200" height="720" aria-label="Canvas do grafo de dependencias"></canvas>
           <div class="legend" aria-label="Legenda">
             <span><b class="dot dot-low"></b>baixo</span>
             <span><b class="dot dot-medium"></b>medio</span>
@@ -153,7 +153,9 @@
           </div>
         </section>
 
-        <section class="data-dock relocation-dock" aria-label="Painel de Relocação">
+        <div id="panelResizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Redimensionar plano" tabindex="0"></div>
+
+        <section class="data-dock relocation-dock" aria-label="Painel de Relocacao">
           <div class="dock-heading">
             <div>
               <h2>Relocar</h2>
@@ -170,7 +172,7 @@
 
         <section class="data-dock" aria-label="Profundidades lidas">
           <details>
-            <summary>Profundidades e memória da varredura</summary>
+            <summary>Profundidades e memoria da varredura</summary>
             <div id="depthTimeline" class="depth-timeline"></div>
           </details>
         </section>
@@ -217,7 +219,10 @@
           <div>
             <h2 id="areModalTitle">Relocar</h2>
           </div>
-          <button id="closeAreModal" class="ghost-button" type="button">X</button>
+          <div class="modal-actions">
+            <button id="toggleAreFullscreen" class="ghost-button" type="button">Tela cheia</button>
+            <button id="closeAreModal" class="ghost-button" type="button">Fechar</button>
+          </div>
         </header>
         <div id="areModalBody" class="modal-body"></div>
       </section>

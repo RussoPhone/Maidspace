@@ -22,7 +22,7 @@ function buildDirectoryState(addReport) {
 
   return {
     schemaVersion: 1,
-    algorithm: "A.L.C",
+    algorithm: "Limpeza",
     rootPath: addReport.rootPath,
     scannedAt: addReport.summary?.scannedAt || new Date().toISOString(),
     summary: {
@@ -40,7 +40,7 @@ function compareDirectoryStates(previousState, currentState) {
   if (!previousState) {
     return {
       schemaVersion: 1,
-      algorithm: "A.L.C",
+      algorithm: "Limpeza",
       mode: "primeiro_estado",
       previousScannedAt: null,
       currentScannedAt: currentState.scannedAt,
@@ -111,7 +111,7 @@ function compareDirectoryStates(previousState, currentState) {
 
   return {
     schemaVersion: 1,
-    algorithm: "A.L.C",
+    algorithm: "Limpeza",
     mode: "comparacao",
     previousScannedAt: previousState.scannedAt,
     currentScannedAt: currentState.scannedAt,
@@ -132,7 +132,7 @@ function compareDirectoryStates(previousState, currentState) {
       dependencyChangedFiles
     },
     recommendation: reanalysisNeeded
-      ? "Mudancas detectadas. Use o A.D.D atualizado antes de qualquer plano de realocacao."
+      ? "Mudancas detectadas. Atualize o grafo antes de qualquer plano de realocacao."
       : "Nenhuma mudanca relevante desde o ultimo estado salvo."
   };
 }

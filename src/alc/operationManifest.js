@@ -155,7 +155,7 @@ function buildOperationItem(file = {}, context = {}) {
     sizeBytes,
     action,
     proposedAction: action,
-    reason: file.reason || file.justification || file.deletionDecision || "selecionado pelo A.L.C",
+    reason: file.reason || file.justification || file.deletionDecision || "selecionado para limpeza",
     risk: file.risk || file.structuralRisk || null,
     plannedDestination,
     status: protectionReason ? "skipped" : "planned",

@@ -43,6 +43,7 @@ const publicDirectory = path.join(rootDirectory, "public");
 const DEFAULT_ALC_WAVE_BYTES = 50 * 1024 * 1024 * 1024;
 const MAX_ALC_WAVE_FILES = 5000;
 const activeAlcCancellations = new Set();
+const activeAlcJobs = new Map();
 
 function createAppServer() {
   return http.createServer(async (request, response) => {
@@ -139,9 +140,30 @@ function createAppServer() {
         return sendJson(response, 200, report);
       }
 
+      if (request.method === "POST" && request.url === "/api/alc/relocate-job") {
+        const body = await readJsonBody(request, { limitBytes: 64 * 1024 * 1024 });
+        const job = startAlcRelocationJob(body.request || {});
+        return sendJson(response, 202, {
+          ok: true,
+          jobId: job.jobId,
+          operationId: job.operationId,
+          progress: job.progress
+        });
+      }
+
+      if (request.method === "GET" && request.url.startsWith("/api/alc/jobs/")) {
+        const jobId = decodeURIComponent(request.url.split("/").pop() || "");
+        const job = activeAlcJobs.get(jobId);
+        if (!job) {
+          return sendJson(response, 404, { error: "Job de limpeza nao encontrado." });
+        }
+        return sendJson(response, 200, serializeAlcJob(job));
+      }
+
       if (request.method === "POST" && request.url === "/api/alc/cancel") {
         const body = await readJsonBody(request).catch(() => ({}));
-        const operationId = sanitizeOperationId(body.operationId || body.request?.operationId);
+        const job = body.jobId ? activeAlcJobs.get(String(body.jobId)) : null;
+        const operationId = sanitizeOperationId(body.operationId || body.request?.operationId || job?.operationId);
         if (operationId) {
           activeAlcCancellations.add(operationId);
         }
@@ -231,17 +253,17 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
     },
     modules: {
       add: {
-        algorithm: "A.D.D",
+        algorithm: "Grafo",
         status: isPartial ? "parcial" : "concluido",
         summary: addReport.summary
       },
       are: {
-        algorithm: "A.R.E",
+        algorithm: "Plano",
         status: isPartial ? "plano_parcial" : "plano_gerado",
         summary: relocationPlan.summary
       },
       alc: {
-        algorithm: "A.L.C",
+        algorithm: "Limpeza",
         status: saveState ? "estado_salvo" : "estado_nao_salvo",
         summary: continuousState.summary,
         statePath
@@ -254,7 +276,91 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
   };
 }
 
-async function executeAlcRelocationServer(request = {}) {
+function startAlcRelocationJob(request = {}) {
+  const operationId = sanitizeOperationId(request.operationId) || createOperationId();
+  const jobId = `alc-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+  const job = {
+    jobId,
+    operationId,
+    status: "running",
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    progress: {
+      phase: request.dryRun ? "dry-run" : "start",
+      percent: 0,
+      movedFiles: 0,
+      failedFiles: 0,
+      skippedFiles: 0,
+      movedBytes: 0,
+      targetBytes: Number(request.targetBytes || 0),
+      currentFile: ""
+    },
+    report: null,
+    error: null
+  };
+  activeAlcJobs.set(jobId, job);
+  cleanupOldAlcJobs();
+
+  executeAlcRelocationServer({ ...request, operationId }, {
+    onProgress(progress) {
+      job.progress = {
+        ...job.progress,
+        ...progress
+      };
+      job.updatedAt = Date.now();
+    }
+  }).then((report) => {
+    job.status = report.cancelled ? "cancelled" : "completed";
+    job.report = report;
+    job.progress = {
+      ...job.progress,
+      phase: report.cancelled ? "cancelled" : "done",
+      percent: report.cancelled ? job.progress.percent || 0 : 100,
+      movedFiles: report.movedFiles,
+      failedFiles: report.failedFiles,
+      skippedFiles: report.skippedFiles,
+      movedBytes: report.movedBytes,
+      targetBytes: report.plannedBytes || job.progress.targetBytes,
+      currentFile: report.progress?.currentFile || ""
+    };
+    job.updatedAt = Date.now();
+  }).catch((error) => {
+    job.status = "failed";
+    job.error = error.message || "Erro inesperado na limpeza.";
+    job.progress = {
+      ...job.progress,
+      phase: "error"
+    };
+    job.updatedAt = Date.now();
+  });
+
+  return job;
+}
+
+function serializeAlcJob(job) {
+  return {
+    jobId: job.jobId,
+    operationId: job.operationId,
+    status: job.status,
+    running: job.status === "running",
+    progress: job.progress,
+    report: job.report,
+    error: job.error,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt
+  };
+}
+
+function cleanupOldAlcJobs() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [jobId, job] of activeAlcJobs.entries()) {
+    if (job.status !== "running" && job.updatedAt < cutoff) {
+      activeAlcJobs.delete(jobId);
+    }
+  }
+}
+
+async function executeAlcRelocationServer(request = {}, runtime = {}) {
   const operationStartedAt = Date.now();
   const planningStartedAt = Date.now();
   const rootPath = request.rootPath || defaultRootPath();
@@ -268,7 +374,7 @@ async function executeAlcRelocationServer(request = {}) {
   const allowPermanentDelete = request.allowPermanentDelete === true;
   let targetKind = String(request.targetKind || "directory").trim().toLowerCase();
   if (!["directory", "trash", "delete", "quarantine"].includes(targetKind)) {
-    throw new Error("Destino A.L.C invalido.");
+    throw new Error("Destino de limpeza invalido.");
   }
   if (targetKind === "trash") {
     targetKind = "quarantine";
@@ -325,6 +431,11 @@ async function executeAlcRelocationServer(request = {}) {
   const seen = new Set();
   const createdDirectories = new Set();
   const targetBytes = Math.max(0, Number(request.targetBytes || 0));
+  emitAlcServerProgress(runtime, report, {
+    phase: dryRun ? "dry-run" : "planning",
+    percent: 0,
+    targetBytes
+  });
 
   if (request.expandPlan && targetBytes > 0 && report.movedBytes < targetBytes) {
     const preferences = await loadRootPreferences(rootPath);
@@ -413,6 +524,11 @@ async function executeAlcRelocationServer(request = {}) {
       effectiveAction,
       dryRun
     });
+    emitAlcServerProgress(runtime, report, {
+      phase: "done",
+      percent: 100,
+      targetBytes: report.plannedBytes
+    });
     return report;
   }
 
@@ -425,17 +541,39 @@ async function executeAlcRelocationServer(request = {}) {
     }
     const prepared = preparedFiles[index];
     report.progress.currentFile = prepared.operation.relativePath;
+    emitAlcServerProgress(runtime, report, {
+      phase: "moving",
+      index,
+      total: preparedFiles.length,
+      currentFile: prepared.operation.relativePath,
+      percent: progressPercent(report.movedBytes, Math.max(report.plannedBytes, targetBytes)),
+      targetBytes: Math.max(report.plannedBytes, targetBytes)
+    });
     if (effectiveAction === "delete_permanent") {
       await deletePreparedFileServer(prepared, report, manifest);
     } else if (effectiveAction === "quarantine") {
-      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, "quarantined");
+      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, "quarantined", {
+        runtime,
+        targetBytes: Math.max(report.plannedBytes, targetBytes)
+      });
     } else {
-      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, effectiveAction === "trash" ? "trashed" : "moved");
+      await movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, effectiveAction === "trash" ? "trashed" : "moved", {
+        runtime,
+        targetBytes: Math.max(report.plannedBytes, targetBytes)
+      });
     }
     report.progress.completedFiles = report.movedFiles;
     report.progress.errorFiles = report.failedFiles;
     report.progress.skippedFiles = report.skippedFiles;
     report.progress.completedBytes = report.movedBytes;
+    emitAlcServerProgress(runtime, report, {
+      phase: report.cancelled ? "cancelled" : "moving",
+      index: index + 1,
+      total: preparedFiles.length,
+      currentFile: prepared.operation.relativePath,
+      percent: progressPercent(report.movedBytes, Math.max(report.plannedBytes, targetBytes)),
+      targetBytes: Math.max(report.plannedBytes, targetBytes)
+    });
   }
   const executionSeconds = secondsSince(executionStartedAt);
   report.averageBytesPerSecond = executionSeconds > 0 ? Math.round(report.movedBytes / executionSeconds) : 0;
@@ -457,7 +595,46 @@ async function executeAlcRelocationServer(request = {}) {
     dryRun
   });
   activeAlcCancellations.delete(operationId);
+  emitAlcServerProgress(runtime, report, {
+    phase: report.cancelled ? "cancelled" : "done",
+    percent: report.cancelled ? progressPercent(report.movedBytes, Math.max(report.plannedBytes, targetBytes)) : 100,
+    targetBytes: Math.max(report.plannedBytes, targetBytes)
+  });
   return report;
+}
+
+function emitAlcServerProgress(runtime, report, extra = {}) {
+  if (typeof runtime?.onProgress !== "function") {
+    return;
+  }
+  const targetBytes = Number(extra.targetBytes || report.plannedBytes || 0);
+  const movedBytes = Number(extra.movedBytes ?? report.movedBytes);
+  runtime.onProgress({
+    phase: extra.phase || "moving",
+    currentFile: extra.currentFile ?? report.progress.currentFile ?? "",
+    index: Number(extra.index ?? report.progress.completedFiles ?? 0),
+    total: Number(extra.total || report.plannedFiles || 0),
+    percent: Number.isFinite(extra.percent) ? extra.percent : progressPercent(movedBytes, targetBytes),
+    movedFiles: report.movedFiles,
+    failedFiles: report.failedFiles,
+    skippedFiles: report.skippedFiles,
+    cancelledFiles: report.cancelledFiles,
+    movedBytes,
+    movedHuman: formatBytesServer(movedBytes),
+    targetBytes,
+    targetHuman: formatBytesServer(targetBytes),
+    waveBytes: report.waveBytes,
+    waveCount: report.waveCount,
+    cancelled: report.cancelled
+  });
+}
+
+function progressPercent(doneBytes, totalBytes) {
+  const total = Number(totalBytes || 0);
+  if (total <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, (Number(doneBytes || 0) / total) * 100));
 }
 
 function secondsSince(startedAt) {
@@ -546,7 +723,7 @@ function sanitizeOperationId(value) {
 async function prepareAlcTargetDirectory(rawTargetDirectory, root) {
   const value = String(rawTargetDirectory || "").trim();
   if (!value) {
-    throw new Error("Escolha uma pasta de destino para o A.L.C.");
+    throw new Error("Escolha uma pasta de destino para a limpeza.");
   }
   await fs.mkdir(value, { recursive: true });
   const target = await realpathOrResolve(value);
@@ -627,7 +804,7 @@ async function prepareAlcFileServer(root, file = {}, report, seen, context = {})
 
   if (!stats.isFile()) {
     operation.status = "skipped";
-    operation.error = "A.L.C fallback move apenas arquivos.";
+    operation.error = "A limpeza move apenas arquivos.";
     report.skippedFiles += 1;
     pushServerOperation(report, operation);
     return null;
@@ -650,7 +827,7 @@ async function prepareAlcFileServer(root, file = {}, report, seen, context = {})
   };
 }
 
-async function movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, successStatus = "moved") {
+async function movePreparedFileServer(prepared, targetDirectory, report, createdDirectories, manifest, successStatus = "moved", progressContext = {}) {
   const destination = uniqueDestinationServer(path.join(targetDirectory, prepared.relative));
   const parent = path.dirname(destination);
   try {
@@ -670,7 +847,18 @@ async function movePreparedFileServer(prepared, targetDirectory, report, created
       await fs.mkdir(parent, { recursive: true });
       createdDirectories.add(parent);
     }
-    await moveFileServer(prepared.source, destination);
+    await moveFileServer(prepared.source, destination, {
+      onProgress(copiedBytes) {
+        const targetBytes = Number(progressContext.targetBytes || report.plannedBytes || 0);
+        emitAlcServerProgress(progressContext.runtime, report, {
+          phase: "moving",
+          currentFile: prepared.operation.relativePath,
+          movedBytes: report.movedBytes + Number(copiedBytes || 0),
+          percent: progressPercent(report.movedBytes + Number(copiedBytes || 0), targetBytes),
+          targetBytes
+        });
+      }
+    });
     prepared.operation.status = "success";
     prepared.operation.action = successStatus;
     prepared.operation.targetPath = destination;
@@ -716,18 +904,18 @@ async function deletePreparedFileServer(prepared, report, manifest) {
   pushServerOperation(report, prepared.operation);
 }
 
-async function moveFileServer(source, destination) {
+async function moveFileServer(source, destination, options = {}) {
   try {
     await fs.rename(source, destination);
   } catch (renameError) {
     if (renameError?.code && renameError.code !== "EXDEV") {
       try {
-        await fs.copyFile(source, destination);
+        await copyFileWithProgressServer(source, destination, options);
       } catch {
         throw renameError;
       }
     } else {
-      await fs.copyFile(source, destination);
+      await copyFileWithProgressServer(source, destination, options);
     }
     try {
       await fs.rm(source, { force: true });
@@ -738,13 +926,58 @@ async function moveFileServer(source, destination) {
   }
 }
 
+async function copyFileWithProgressServer(source, destination, options = {}) {
+  await new Promise((resolve, reject) => {
+    const read = fsSync.createReadStream(source, { highWaterMark: 8 * 1024 * 1024 });
+    const write = fsSync.createWriteStream(destination, { flags: "wx" });
+    let copiedBytes = 0;
+    let lastEmitAt = 0;
+    let settled = false;
+
+    const fail = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      read.destroy();
+      write.destroy();
+      try {
+        fsSync.rmSync(destination, { force: true });
+      } catch {}
+      reject(error);
+    };
+
+    read.on("data", (chunk) => {
+      copiedBytes += chunk.length;
+      const now = Date.now();
+      if (typeof options.onProgress === "function" && now - lastEmitAt >= 250) {
+        lastEmitAt = now;
+        options.onProgress(copiedBytes);
+      }
+    });
+    read.on("error", fail);
+    write.on("error", fail);
+    write.on("finish", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (typeof options.onProgress === "function") {
+        options.onProgress(copiedBytes);
+      }
+      resolve();
+    });
+    read.pipe(write);
+  });
+}
+
 function safeRelativePathServer(rawPath) {
   if (!rawPath) {
     throw new Error("Caminho vazio.");
   }
   const normalized = String(rawPath).replace(/\\/g, "/");
   if (path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
-    throw new Error("Caminho absoluto nao e aceito pelo A.L.C.");
+    throw new Error("Caminho absoluto nao e aceito na limpeza.");
   }
   const parts = normalized.split("/").filter(Boolean);
   if (!parts.length || parts.some((part) => part === "." || part === "..")) {
@@ -800,7 +1033,7 @@ function serverOperationToManifestItem(operation = {}) {
     sizeBytes: Number(operation.sizeBytes || 0),
     action: operation.action || operation.proposedAction || "move",
     proposedAction: operation.action || operation.proposedAction || "move",
-    reason: operation.reason || operation.error || "selecionado pelo A.L.C",
+    reason: operation.reason || operation.error || "selecionado para limpeza",
     risk: operation.risk || null,
     plannedDestination: operation.plannedDestination || null,
     status: normalizeManifestStatus(operation.status),
@@ -1010,7 +1243,7 @@ function compactStreamResult(result, options = {}) {
     skipped: (result.skipped || []).slice(0, 300),
     warnings: [
       ...(result.warnings || []),
-      `stream compactado: exibindo ${compactNodes.length}/${(result.nodes || []).length} nos e ${compactEdges.length}/${(result.edges || []).length} arestas; totais do A.D.D/A.R.E permanecem calculados sobre a varredura completa.`
+      `stream compactado: exibindo ${compactNodes.length}/${(result.nodes || []).length} nos e ${compactEdges.length}/${(result.edges || []).length} arestas; totais do grafo e do plano permanecem calculados sobre a varredura completa.`
     ],
     uiLimits: {
       compacted: true,

@@ -92,11 +92,11 @@ function generateRelocationPlan(addReport, options = {}) {
 
   return {
     schemaVersion: 4,
-    algorithm: "A.R.E",
+    algorithm: "Plano",
     safeMode: true,
     generatedAt: new Date().toISOString(),
     rootPath: addReport.rootPath,
-    objective: "calcular quanto espaco pode ser realocado com seguranca usando o relatorio do A.D.D",
+    objective: "calcular quanto espaco pode ser realocado com seguranca usando o grafo de dependencias",
     question: "Quanto pode ser realocado?",
     summary: {
       totalFiles,
@@ -182,7 +182,7 @@ function generateRelocationPlan(addReport, options = {}) {
       "Modo medio aceita pacotes antigos quando o componente inteiro pode ser realocado junto.",
       "Modo alto e agressivo, mas bloqueia sistema, estruturas protegidas, ciclos e dependencias essenciais.",
       "Em inventarios grandes, os totais podem vir da estimativa completa por metadados enquanto as listas exibem os principais candidatos detalhados.",
-      "O A.R.E calcula ganho espacial; a execucao real depende de confirmacao do usuario."
+      "O plano calcula ganho espacial; a execucao real depende de confirmacao do usuario."
     ],
     note: "Simulacao espacial: bytes realocados representam o que sairia do diretorio principal se o usuario confirmasse a realocacao indicada."
   };
@@ -345,7 +345,7 @@ function modeEligibilityReason(mode, node, packageNodes, profile, absoluteBlockR
   }
   if (mode === "baixo") {
     if (node.classification !== "isolado") {
-      return { allowed: false, reason: "modo baixo exige classificacao isolado pelo A.D.D" };
+      return { allowed: false, reason: "modo baixo exige classificacao isolada pelo grafo" };
     }
     if ((node.incoming || 0) > 0 || (node.outgoing || 0) > 0 || (node.impactCount || 0) > 0) {
       return { allowed: false, reason: "modo baixo exige impacto zero em dependencias" };
@@ -707,7 +707,7 @@ function toBlockedFile(entry) {
 
 function justificationFor(node, modes, absoluteBlockReasons, modeReasons, profile) {
   if (!modes.length) {
-    return absoluteBlockReasons[0] || modeReasons.alto || "nao passou nos criterios espaciais do A.R.E";
+    return absoluteBlockReasons[0] || modeReasons.alto || "nao passou nos criterios espaciais do plano";
   }
   if (modes.includes("baixo")) {
     return `isolado, antigo e com perfil seguro (${profile.categories.join(", ") || "baixo risco"})`;
@@ -869,7 +869,7 @@ function buildSafetyReport(spaceModes, blockedFiles, cycles) {
       `Modo medio pode realocar ${spaceModes.medio.reallocatableHuman}.`,
       `Modo alto pode realocar ${spaceModes.alto.reallocatableHuman}.`,
       `${blockedFiles.length} arquivo(s) foram bloqueados por risco, uso recente, sistema, ciclo ou dependencia compartilhada.`,
-      "Nenhuma acao e executada automaticamente; o A.R.E so calcula ganho espacial e prepara a decisao do usuario."
+      "Nenhuma acao e executada automaticamente; o plano so calcula ganho espacial e prepara a decisao do usuario."
     ].join(" ")
   };
 }

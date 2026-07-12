@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "description": "Base local do A.D.D para classificar tipos de arquivo por risco, utilidade e relacao com o sistema.",
+  "description": "Base local do grafo para classificar tipos de arquivo por risco, utilidade e relacao com o sistema.",
   "systemEssential": {
     "names": [
       "boot.ini",
@@ -177,6 +177,6 @@
   "recentUse": {
     "frequentWindowDays": 7,
     "unusedWindowDays": 30,
-    "note": "O A.D.D usa o ultimo acesso do sistema de arquivos quando disponivel; se o Windows nao mantiver atime atualizado, a classificacao cai para averiguar em vez de apagar."
+    "note": "O grafo usa o ultimo acesso do sistema de arquivos quando disponivel; se o Windows nao mantiver atime atualizado, a classificacao cai para averiguar em vez de apagar."
   }
 }

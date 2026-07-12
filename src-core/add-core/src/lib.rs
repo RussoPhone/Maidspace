@@ -214,7 +214,7 @@ pub fn analyze_directory(root: &Path, options: AnalyzeOptions) -> anyhow::Result
     };
 
     Ok(AddReport {
-        algorithm: "A.D.D".to_string(),
+        algorithm: "Grafo".to_string(),
         root_path: root.display().to_string(),
         summary,
         files,

@@ -347,7 +347,7 @@ fn run_scan_job_thread(
         inventory.bytes,
         started_at,
         true,
-        "Analisando riscos e plano A.R.E",
+        "Analisando riscos e plano",
         None,
         None,
     );
@@ -808,7 +808,7 @@ fn expand_alc_candidates(request: AlcExpandRequest) -> Result<AlcExpandReport, S
     while let Some(directory) = stack.pop_back() {
         if started.elapsed() > Duration::from_secs(10 * 60) {
             stop_reason = Some(String::from(
-                "Expansao A.L.C interrompida por limite de tempo; candidatos parciais mantidos.",
+                "Expansao da limpeza interrompida por limite de tempo; candidatos parciais mantidos.",
             ));
             break;
         }
@@ -916,12 +916,12 @@ fn expand_alc_candidates(request: AlcExpandRequest) -> Result<AlcExpandReport, S
             bytes = bytes.saturating_add(size);
             candidates.push(candidate);
             if candidates.len() >= limit {
-                stop_reason = Some(format!("Expansao A.L.C parou em {limit} candidato(s)."));
+                stop_reason = Some(format!("Expansao da limpeza parou em {limit} candidato(s)."));
                 break;
             }
             if target_bytes > 0 && bytes >= target_bytes {
                 stop_reason = Some(format!(
-                    "Expansao A.L.C atingiu {} para meta {}.",
+                    "Expansao da limpeza atingiu {} para meta {}.",
                     format_bytes(bytes),
                     format_bytes(target_bytes)
                 ));
@@ -992,7 +992,7 @@ fn execute_alc_relocation(
         && target_kind != "delete"
         && target_kind != "quarantine"
     {
-        return Err(String::from("Destino A.L.C invalido."));
+        return Err(String::from("Destino de limpeza invalido."));
     }
     let dry_run = request.dry_run.unwrap_or(false);
     let allow_permanent_delete = request.allow_permanent_delete.unwrap_or(false);
@@ -1015,7 +1015,7 @@ fn execute_alc_relocation(
             .as_ref()
             .map(|path| path.trim())
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| String::from("Escolha uma pasta de destino para o A.L.C."))?;
+            .ok_or_else(|| String::from("Escolha uma pasta de destino para a limpeza."))?;
         let target = PathBuf::from(value);
         fs::create_dir_all(&target)
             .map_err(|error| format!("Nao foi possivel criar o destino: {error}"))?;
@@ -1378,7 +1378,7 @@ fn prepare_alc_file(
             .reason
             .clone()
             .or(file.deletion_decision.clone())
-            .unwrap_or_else(|| String::from("selecionado pelo A.L.C")),
+            .unwrap_or_else(|| String::from("selecionado para limpeza")),
         risk: file.risk.clone(),
         planned_destination: file.planned_destination.clone(),
         target_path: None,
@@ -1447,7 +1447,7 @@ fn prepare_alc_file(
 
     if !metadata.is_file() {
         operation.status = String::from("skipped");
-        operation.error = Some(String::from("A.L.C MVP move apenas arquivos."));
+        operation.error = Some(String::from("A limpeza move apenas arquivos."));
         report.skipped_files += 1;
         push_operation_report(report, operation);
         return None;
@@ -1474,7 +1474,7 @@ fn move_prepared_file_to_directory(
         mut operation,
     } = prepared;
     let Some(target_root) = target_directory else {
-        operation.error = Some(String::from("Destino A.L.C ausente."));
+        operation.error = Some(String::from("Destino de limpeza ausente."));
         report.failed_files += 1;
         push_operation_report(report, operation);
         return;
@@ -1764,7 +1764,7 @@ fn stream_relocate_alc_plan(
                         &extension,
                     )),
                     risk: None,
-                    reason: Some(String::from("expansao local A.L.C")),
+                    reason: Some(String::from("expansao local de limpeza")),
                     deletion_decision: None,
                     planned_destination: None,
                     manual_approval: None,
@@ -1997,7 +1997,7 @@ fn operation_manifest_json(
                     "sizeBytes": file.size.unwrap_or(0),
                     "action": action,
                     "proposedAction": action,
-                    "reason": file.reason.clone().or(file.deletion_decision.clone()).unwrap_or_else(|| String::from("selecionado pelo A.L.C")),
+                    "reason": file.reason.clone().or(file.deletion_decision.clone()).unwrap_or_else(|| String::from("selecionado para limpeza")),
                     "risk": file.risk.clone(),
                     "plannedDestination": planned_destination_for_manifest(&relative, effective_action, target_directory, quarantine_root),
                     "status": if protected.is_some() { "skipped" } else { "planned" },
@@ -2237,12 +2237,12 @@ fn alc_candidate_json(
         "medio"
     };
     let justification = match cleanup_mode {
-        "baixo" => "inventario local A.L.C: cache, temporario ou log antigo",
-        "medio" => "inventario local A.L.C: pacote, instalador ou gerado de baixo uso",
+        "baixo" => "inventario local: cache, temporario ou log antigo",
+        "medio" => "inventario local: pacote, instalador ou gerado de baixo uso",
         _ if is_user_content_path_native(relative, extension) => {
-            "inventario local A.L.C: conteudo grande ou antigo para revisao"
+            "inventario local: conteudo grande ou antigo para revisao"
         }
-        _ => "inventario local A.L.C: candidato do nivel alto",
+        _ => "inventario local: candidato do nivel alto",
     };
     json!({
         "mode": selected_mode,
@@ -2587,7 +2587,7 @@ fn parse_disk_pair(text: &str) -> Result<(u64, u64), String> {
 fn safe_relative_path(raw: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw);
     if path.is_absolute() {
-        return Err(String::from("Caminho absoluto nao e aceito pelo A.L.C."));
+        return Err(String::from("Caminho absoluto nao e aceito na limpeza."));
     }
 
     let mut clean = PathBuf::new();

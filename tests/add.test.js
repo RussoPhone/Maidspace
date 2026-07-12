@@ -20,7 +20,7 @@ test.after(async () => {
   await fs.rm(testDataDir, { recursive: true, force: true });
 });
 
-test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
+test("Grafo classifica dicente, docente, isolado e protegido", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-"));
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "src", "app.js"), "import { helper } from './lib.js';\nimport './style.css';\nhelper();\n");
@@ -71,7 +71,7 @@ test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
   assert.ok(result.simulation.decisionGroups.nao_apagar.length >= 1);
 });
 
-test("A.D.D evita falsos positivos em conteudo do usuario e estado de aplicativo", async () => {
+test("Grafo evita falsos positivos em conteudo do usuario e estado de aplicativo", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-user-safe-"));
   await fs.mkdir(path.join(root, "Users", "me", "Downloads"), { recursive: true });
   await fs.mkdir(path.join(root, "Users", "me", "AppData", "Roaming", "Editor"), { recursive: true });
@@ -169,7 +169,7 @@ test("Preferencias do usuario bloqueiam arquivos ignorados e pastas isentas", ()
   assert.equal(plan.candidatesByMode.alto.some((item) => item.path === "Users/me/Documents/work.db"), false);
 });
 
-test("A.D.D resolve import Python relativo", async () => {
+test("Grafo resolve import Python relativo", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-py-"));
   await fs.mkdir(path.join(root, "pkg"), { recursive: true });
   await fs.writeFile(path.join(root, "pkg", "__init__.py"), "");
@@ -187,7 +187,7 @@ test("A.D.D resolve import Python relativo", async () => {
   assert.ok(edge, "esperava aresta Python relativa entre main.py e utils.py");
 });
 
-test("A.D.D detecta ciclo por DFS e marca bloco interdependente", async () => {
+test("Grafo detecta ciclo por DFS e marca bloco interdependente", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-add-cycle-"));
   await fs.writeFile(path.join(root, "a.js"), "import './b.js';\n");
   await fs.writeFile(path.join(root, "b.js"), "import './c.js';\n");
@@ -209,7 +209,7 @@ test("A.D.D detecta ciclo por DFS e marca bloco interdependente", async () => {
   assert.ok(byPath.get("a.js").simulation.moveRequires.includes("b.js"));
 });
 
-test("MaidSpace gera plano A.R.E e estado A.L.C sem mover arquivos", async () => {
+test("MaidSpace gera plano e estado de limpeza sem mover arquivos", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-pipeline-"));
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "src", "main.js"), "import './dep.js';\n");
@@ -233,10 +233,10 @@ test("MaidSpace gera plano A.R.E e estado A.L.C sem mover arquivos", async () =>
   assert.equal(result.modules.alc.status, "estado_nao_salvo");
   assert.ok(result.relocationPlan.operations.some((item) => item.source === "notes.txt"));
   assert.equal(result.continuousState.mode, "primeiro_estado");
-  assert.match(result.report.text, /A\.D\.D/);
+  assert.match(result.report.text, /Grafo de Dependencias/);
 });
 
-test("A.R.E calcula espaco realocavel por modo e arquivos bloqueados", async () => {
+test("Plano calcula espaco realocavel por modo e arquivos bloqueados", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-are-space-"));
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "old.tmp"), Buffer.alloc(4096));
@@ -278,7 +278,7 @@ test("A.R.E calcula espaco realocavel por modo e arquivos bloqueados", async () 
   assert.match(plan.safetyReport.text, /Modo baixo/);
 });
 
-test("Varredura progressiva atualiza A.D.D e A.R.E por profundidade", async () => {
+test("Varredura progressiva atualiza Grafo e Plano por profundidade", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-progressive-"));
   await fs.mkdir(path.join(root, "nivel1", "nivel2", "nivel3"), { recursive: true });
   await fs.writeFile(path.join(root, "raiz.tmp"), "temporario antigo\n");
@@ -360,7 +360,7 @@ test("Fallback progressivo HTTP emite relatorio final com tempos", async () => {
   }
 });
 
-test("A.D.D permite alternar leitura de Program Files", async () => {
+test("Grafo permite alternar leitura de Program Files", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-program-files-"));
   await fs.mkdir(path.join(root, "Program Files", "Tool", "downloads"), { recursive: true });
   await fs.writeFile(path.join(root, "Program Files", "Tool", "downloads", "cache.tmp"), "cache antigo\n");
@@ -389,7 +389,7 @@ test("A.D.D permite alternar leitura de Program Files", async () => {
   assert.equal(allowed.nodes.find((node) => node.relativePath === "Program Files/Tool/tool.dll").fileKnowledge.isInstalledApplication, true);
 });
 
-test("A.D.D registra areas grandes por padrao sem isentar a pasta inteira", async () => {
+test("Grafo registra areas grandes por padrao sem isentar a pasta inteira", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-full-storage-"));
   await fs.mkdir(path.join(root, "Program Files (x86)", "Steam", "steamapps"), { recursive: true });
   await fs.mkdir(path.join(root, "Users", "me", "AppData", "Local", "Temp"), { recursive: true });
@@ -411,7 +411,7 @@ test("A.D.D registra areas grandes por padrao sem isentar a pasta inteira", asyn
   assert.notEqual(byPath.get("Program Files (x86)/Steam/steamapps/game.bin").classification, "critico_protegido");
 });
 
-test("A.D.D padrao pula apenas diretorios obvios do sistema e mantem areas limpaveis", async () => {
+test("Grafo padrao pula apenas diretorios obvios do sistema e mantem areas limpaveis", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-system-skip-"));
   await fs.mkdir(path.join(root, "Windows", "System32"), { recursive: true });
   await fs.mkdir(path.join(root, "ProgramData", "Vendor", "Cache"), { recursive: true });
@@ -436,7 +436,7 @@ test("A.D.D padrao pula apenas diretorios obvios do sistema e mantem areas limpa
   assert.equal(byPath.get("ProgramData/Vendor/Cache/blob.tmp").classification, "isolado");
 });
 
-test("A.R.E alto apresenta potencial de 100GB fora de sistema sem desbloquear System32", () => {
+test("Plano alto apresenta potencial de 100GB fora de sistema sem desbloquear System32", () => {
   const hundredGb = 100 * 1024 * 1024 * 1024;
   const now = new Date().toISOString();
   const addReport = {
@@ -506,7 +506,7 @@ test("A.R.E alto apresenta potencial de 100GB fora de sistema sem desbloquear Sy
   assert.ok(plan.blockedFiles.some((item) => item.path === "Windows/System32/kernel32.dll"));
 });
 
-test("A.R.E usa estimativa completa do inventario quando detalhes sao compactados", () => {
+test("Plano usa estimativa completa do inventario quando detalhes sao compactados", () => {
   const hundredGb = 100 * 1024 * 1024 * 1024;
   const addReport = {
     rootPath: "C:/",
@@ -536,7 +536,7 @@ test("A.R.E usa estimativa completa do inventario quando detalhes sao compactado
   assert.equal(plan.summary.inventoryEstimatedReclaimableHuman.alto, "100 GB");
 });
 
-test("A.R.E monta meta personalizada por aproximacao sem mover nivel inteiro", () => {
+test("Plano monta meta personalizada por aproximacao sem mover nivel inteiro", () => {
   const mb = 1024 * 1024;
   const old = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const addReport = {
@@ -588,7 +588,7 @@ function relocationNode(relativePath, size, timestamp) {
   };
 }
 
-test("A.D.D agrupa DPN em HF e usa DFS limitado apenas em alvo de risco", async () => {
+test("Grafo agrupa DPN em HF e usa DFS limitado apenas em alvo de risco", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-hf-dpn-"));
   await fs.mkdir(path.join(root, "Heavy"), { recursive: true });
   await fs.writeFile(path.join(root, "Heavy", "app.js"), `import './lib.js';\n${"x".repeat(8192)}\n`);
@@ -648,7 +648,7 @@ test("Varredura turbo inventaria metadados sem bloquear no grafo profundo", asyn
   assert.ok(result.relocationPlan.summary.reallocatable.alto >= 32 * 1024);
 });
 
-test("A.L.C gera manifesto, dry-run e bloqueia caminho protegido", () => {
+test("Limpeza gera manifesto, dry-run e bloqueia caminho protegido", () => {
   assert.equal(isProtectedPath("Windows/System32/kernel32.dll"), true);
   assert.equal(isProtectedPath("Users/me/Documents/tese.pdf"), true);
   assert.equal(isProtectedPath("Users/me/Documents/tese.pdf", { manualApproval: true }), false);
@@ -681,7 +681,7 @@ test("A.L.C gera manifesto, dry-run e bloqueia caminho protegido", () => {
   assert.equal(manifest.items[0].status, "success");
 });
 
-test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
+test("Limpeza fallback simula sem mover arquivos via HTTP", async () => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-alc-dry-"));
   const root = path.join(base, "root");
   const server = createAppServer();
@@ -728,7 +728,7 @@ test("A.L.C fallback simula sem mover arquivos via HTTP", async () => {
   }
 });
 
-test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
+test("Limpeza fallback move e quarentena arquivos via HTTP", async () => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "src-alc-http-"));
   const root = path.join(base, "root");
   const destination = path.join(base, "dest");
@@ -774,6 +774,42 @@ test("A.L.C fallback move e quarentena arquivos via HTTP", async () => {
     assert.ok(moveReport.averageBytesPerSecond >= 0);
     await assert.rejects(fs.access(path.join(root, "move-me.txt")));
     await fs.access(path.join(destination, "move-me.txt"));
+
+    await fs.writeFile(path.join(root, "job-me.txt"), "job");
+    const jobResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/relocate-job`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request: {
+          operationId: "test-job-op-1",
+          rootPath: root,
+          targetKind: "directory",
+          targetDirectory: destination,
+          auditSource: "expanded",
+          auditedItemCount: 1,
+          files: [{ relativePath: "job-me.txt" }]
+        }
+      })
+    });
+    const jobStarted = await jobResponse.json();
+    assert.equal(jobResponse.status, 202, jobStarted.error || "falha HTTP");
+    assert.ok(jobStarted.jobId);
+    let jobPayload = jobStarted;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const pollResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/jobs/${encodeURIComponent(jobStarted.jobId)}`);
+      jobPayload = await pollResponse.json();
+      assert.equal(pollResponse.ok, true, jobPayload.error || "falha HTTP");
+      if (jobPayload.status !== "running") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(jobPayload.status, "completed");
+    assert.equal(jobPayload.report.movedFiles, 1);
+    assert.equal(jobPayload.report.auditedItemCount, 1);
+    assert.ok(jobPayload.progress.percent >= 100);
+    await assert.rejects(fs.access(path.join(root, "job-me.txt")));
+    await fs.access(path.join(destination, "job-me.txt"));
 
     const cancelResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/alc/cancel`, {
       method: "POST",

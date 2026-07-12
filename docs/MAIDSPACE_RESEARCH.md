@@ -18,7 +18,7 @@ MaidSpace precisa inventariar o armazenamento inteiro, achar espaco liberavel em
    - Em Windows/NTFS, evoluir o motor Rust para `FSCTL_ENUM_USN_DATA`, `FSCTL_READ_USN_JOURNAL` e, quando preciso, `GetFileInformationByHandleEx`.
    - Enquanto a leitura MFT/USN completa nao entra, usar o inventario turbo via `robocopy /L /E /BYTES /FP /TS /XJ` como ponte local.
 
-2. **Banco auxiliar A.L.C**
+2. **Banco auxiliar de limpeza**
    - Guardar o ultimo snapshot por volume.
    - Atualizar por heartbeat de grupos DPN: extensao, idade, pasta pesada, risco, dependencia e uso recente.
    - Usar USN Journal para scans incrementais depois do primeiro baseline.
@@ -30,7 +30,7 @@ MaidSpace precisa inventariar o armazenamento inteiro, achar espaco liberavel em
 
 4. **Plano por meta**
    - O usuario diz quanto quer liberar.
-   - A.R.E escolhe o menor modo que atinge a meta: baixo, medio ou alto.
+   - O plano escolhe o menor modo que atinge a meta: baixo, medio ou alto.
    - Quando a lista detalhada foi compactada, o plano pode usar estimativa total do inventario e pedir uma segunda passagem focada so nos blocos necessarios.
 
 5. **Limpeza constante sem interferir**
@@ -62,7 +62,7 @@ MaidSpace precisa inventariar o armazenamento inteiro, achar espaco liberavel em
 - Dependencias Node instaladas e Tauri CLI travado no lockfile.
 - Rust instalado e `cargo check` validado para o core e para o app Tauri.
 - Interface Tauri chama `analyze_maidspace` localmente; Node fica como fallback.
-- A.R.E aceita meta de GB e calcula o menor modo possivel.
+- O plano aceita meta de GB e calcula o menor modo possivel.
 - Inventario JS turbo calcula totais completos e compacta apenas os detalhes.
 - Grafo ganhou zoom/pan e clique para detalhes.
 
