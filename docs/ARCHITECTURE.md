@@ -34,3 +34,4 @@ Mantenha mudancas pequenas. A interface pode mudar, mas a selecao de arquivos e 
 ## Leitura complementar
 
 - [PERFORMANCE.md](PERFORMANCE.md)
+- [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)

@@ -155,6 +155,13 @@ struct AlcProgressTicker {
     last_emit: Instant,
 }
 
+struct AlcMoveProgressContext<'a> {
+    app: &'a AppHandle,
+    index: usize,
+    total: usize,
+    target_bytes: u64,
+}
+
 impl AlcProgressTicker {
     fn new() -> Self {
         Self {
@@ -1144,6 +1151,12 @@ fn execute_alc_relocation(
                     } else {
                         None
                     },
+                    Some(AlcMoveProgressContext {
+                        app: &app,
+                        index: index + 1,
+                        total: total_preview_files,
+                        target_bytes: progress_target_bytes,
+                    }),
                 );
             }
         }
@@ -1467,6 +1480,7 @@ fn move_prepared_file_to_directory(
     report: &mut AlcRelocationReport,
     created_directories: &mut HashSet<PathBuf>,
     success_action: Option<&str>,
+    progress: Option<AlcMoveProgressContext<'_>>,
 ) {
     let PreparedAlcFile {
         source,
@@ -1480,7 +1494,31 @@ fn move_prepared_file_to_directory(
         return;
     };
     let destination = unique_destination(&target_root.join(&relative));
-    let result = move_file_to(&source, &destination, created_directories)
+    let base_moved_bytes = report.moved_bytes;
+    let current_file = operation.relative_path.clone();
+    let mut last_emit = Instant::now()
+        .checked_sub(ALC_PROGRESS_TIME_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut on_copy_progress = |copied_bytes: u64| {
+        if let Some(context) = progress.as_ref() {
+            if last_emit.elapsed() >= ALC_PROGRESS_TIME_INTERVAL {
+                emit_alc_progress_with_moved_bytes(
+                    context.app,
+                    "move",
+                    Some(current_file.as_str()),
+                    context.index,
+                    context.total,
+                    report,
+                    context.target_bytes,
+                    base_moved_bytes.saturating_add(copied_bytes),
+                );
+                last_emit = Instant::now();
+            }
+        }
+    };
+    let move_result = move_file_to(&source, &destination, created_directories, Some(&mut on_copy_progress));
+    drop(on_copy_progress);
+    let result = move_result
         .map(|_| {
             operation.status = String::from("success");
             operation.action = success_action.unwrap_or("moved").to_string();
@@ -1785,13 +1823,20 @@ fn stream_relocate_alc_plan(
                 } else if target_kind == "delete" {
                     delete_prepared_file(prepared, report);
                 } else {
-                move_prepared_file_to_directory(
-                    target_directory,
-                    prepared,
-                    report,
-                    &mut created_directories,
-                    None,
-                );
+                    let progress_index = report.requested_files;
+                    move_prepared_file_to_directory(
+                        target_directory,
+                        prepared,
+                        report,
+                        &mut created_directories,
+                        None,
+                        Some(AlcMoveProgressContext {
+                            app,
+                            index: progress_index,
+                            total: progress_index,
+                            target_bytes,
+                        }),
+                    );
                 }
             }
             progress_ticker.emit(
@@ -1847,8 +1892,30 @@ fn emit_alc_progress(
     report: &AlcRelocationReport,
     target_bytes: u64,
 ) {
+    emit_alc_progress_with_moved_bytes(
+        app,
+        phase,
+        current_file,
+        index,
+        total,
+        report,
+        target_bytes,
+        report.moved_bytes,
+    );
+}
+
+fn emit_alc_progress_with_moved_bytes(
+    app: &AppHandle,
+    phase: &str,
+    current_file: Option<&str>,
+    index: usize,
+    total: usize,
+    report: &AlcRelocationReport,
+    target_bytes: u64,
+    moved_bytes: u64,
+) {
     let byte_percent = if target_bytes > 0 {
-        (report.moved_bytes as f64 / target_bytes as f64) * 100.0
+        (moved_bytes as f64 / target_bytes as f64) * 100.0
     } else {
         0.0
     };
@@ -1870,8 +1937,8 @@ fn emit_alc_progress(
             "failedFiles": report.failed_files,
             "skippedFiles": report.skipped_files,
             "cancelledFiles": report.cancelled_files,
-            "movedBytes": report.moved_bytes,
-            "movedHuman": format_bytes(report.moved_bytes),
+            "movedBytes": moved_bytes,
+            "movedHuman": format_bytes(moved_bytes),
             "targetBytes": target_bytes,
             "targetHuman": format_bytes(target_bytes),
             "waveBytes": report.wave_bytes,
@@ -2631,6 +2698,7 @@ fn move_file_to(
     source: &Path,
     destination: &Path,
     created_directories: &mut HashSet<PathBuf>,
+    on_copy_progress: Option<&mut dyn FnMut(u64)>,
 ) -> io::Result<()> {
     if let Some(parent) = destination.parent() {
         if created_directories.insert(parent.to_path_buf()) {
@@ -2645,7 +2713,7 @@ fn move_file_to(
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
-            copy_file_cancellable(source, destination).map_err(|copy_error| {
+            copy_file_cancellable(source, destination, on_copy_progress).map_err(|copy_error| {
                 io::Error::new(
                     copy_error.kind(),
                     format!("rename: {rename_error}; copy: {copy_error}"),
@@ -2662,7 +2730,11 @@ fn move_file_to(
     }
 }
 
-fn copy_file_cancellable(source: &Path, destination: &Path) -> io::Result<u64> {
+fn copy_file_cancellable(
+    source: &Path,
+    destination: &Path,
+    mut on_progress: Option<&mut dyn FnMut(u64)>,
+) -> io::Result<u64> {
     let mut input = fs::File::open(source)?;
     let mut output = fs::File::create(destination)?;
     let mut buffer = vec![0u8; ALC_COPY_BUFFER_BYTES];
@@ -2679,9 +2751,15 @@ fn copy_file_cancellable(source: &Path, destination: &Path) -> io::Result<u64> {
         }
         output.write_all(&buffer[..read])?;
         written = written.saturating_add(read as u64);
+        if let Some(callback) = on_progress.as_deref_mut() {
+            callback(written);
+        }
     }
 
     output.flush()?;
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(written);
+    }
     Ok(written)
 }
 

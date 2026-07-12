@@ -54,6 +54,10 @@ Saidas comuns:
 - `src-tauri\target\release\bundle\nsis\`
 - `src-tauri\target\release\bundle\msi\`
 
+## Release beta
+
+Antes de publicar, siga [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+
 ## Testes
 
 ```powershell
